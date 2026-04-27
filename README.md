@@ -1,0 +1,2 @@
+# CLIProxyAPIClient
+基于CLIProxyAPI做的一个客户端，方便管理和切换版本
