@@ -74,8 +74,15 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Flatten release assets
+        shell: bash
+        run: |
+          mkdir -p release-upload
+          find release-assets -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release-upload/ \;
+          test "$(find release-upload -type f | wc -l)" -gt 0
+
       - name: Show release assets
-        run: find release-assets -maxdepth 2 -type f -print
+        run: find release-upload -maxdepth 1 -type f -print
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -93,4 +100,4 @@ jobs:
             Assets:
             - macOS Apple Silicon: DMG installer
             - Windows x64: MSI and/or NSIS installer
-          files: release-assets/*
+          files: release-upload/*
