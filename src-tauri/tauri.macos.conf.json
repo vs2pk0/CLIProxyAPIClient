@@ -1,0 +1,5 @@
+{
+  "bundle": {
+    "resources": ["resources/CLIProxyAPI_6.9.36_darwin_arm64.tar.gz"]
+  }
+}
