@@ -2,7 +2,8 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Read, Write},
+    net::TcpStream,
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -16,6 +17,7 @@ const BINARY_BASENAME: &str = "cli-proxy-api";
 const DEFAULT_CONFIG_CACHE: &str = "default-config.yaml";
 const DEFAULT_AUTH_DIR: &str = "~/.cli-proxy-api";
 const DEFAULT_RUNTIME_VERSION: &str = "6.9.36";
+const USAGE_BACKUP_FILE: &str = "usage-statistics.json";
 
 #[derive(Default)]
 struct ProcessState(Mutex<Option<Child>>);
@@ -263,6 +265,9 @@ fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Des
     if let Some(pid) = detect_managed_service_pid(&dirs, &stored, &config_path)? {
         stored.managed_pid = Some(pid);
         write_stored_state(&dirs, &stored)?;
+        if let Err(err) = restore_usage_statistics(&app) {
+            eprintln!("failed to restore CLIProxyAPI usage statistics: {err}");
+        }
         return build_desktop_state(&app, &process);
     }
     reject_unmanaged_port_listener(&dirs, &config_path)?;
@@ -293,11 +298,19 @@ fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Des
     stored.managed_pid = Some(child_pid);
     write_stored_state(&dirs, &stored)?;
 
+    if let Err(err) = restore_usage_statistics(&app) {
+        eprintln!("failed to restore CLIProxyAPI usage statistics: {err}");
+    }
+
     build_desktop_state(&app, &process)
 }
 
 #[tauri::command]
 fn stop_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<DesktopState, String> {
+    if let Err(err) = backup_usage_statistics(&app, &process) {
+        eprintln!("failed to backup CLIProxyAPI usage statistics: {err}");
+    }
+
     let mut guard = process
         .0
         .lock()
@@ -392,6 +405,220 @@ fn open_management_web(app: AppHandle) -> Result<(), String> {
         .management_url
         .ok_or_else(|| "配置文件缺少可访问的 Web 端口".to_string())?;
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|err| format!("打开浏览器失败: {err}"))
+}
+
+fn backup_usage_statistics(
+    app: &AppHandle,
+    process: &State<'_, ProcessState>,
+) -> Result<(), String> {
+    if service_pid_for_state(app, process)?.is_none() {
+        return Ok(());
+    }
+
+    let dirs = AppDirs::new(app)?;
+    let Some((port, management_key)) = usage_management_context(&dirs)? else {
+        return Ok(());
+    };
+    let body = management_http_request(
+        port,
+        &management_key,
+        "GET",
+        "/v0/management/usage/export",
+        None,
+    )?;
+
+    let backup_path = usage_backup_path(&dirs);
+    if !should_write_usage_backup(&backup_path, &body) {
+        return Ok(());
+    }
+    fs::create_dir_all(&dirs.app_data_dir).map_err(|err| format!("创建应用数据目录失败: {err}"))?;
+    let temp_path = backup_path.with_extension("json.tmp");
+    fs::write(&temp_path, body).map_err(|err| format!("写入使用统计备份失败: {err}"))?;
+    fs::rename(&temp_path, &backup_path).map_err(|err| format!("保存使用统计备份失败: {err}"))?;
+    Ok(())
+}
+
+fn restore_usage_statistics(app: &AppHandle) -> Result<(), String> {
+    let dirs = AppDirs::new(app)?;
+    let backup_path = usage_backup_path(&dirs);
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    let body = fs::read(&backup_path).map_err(|err| format!("读取使用统计备份失败: {err}"))?;
+    if body.is_empty() || usage_total_requests(&body) == 0 {
+        return Ok(());
+    }
+
+    let Some((port, management_key)) = usage_management_context(&dirs)? else {
+        return Ok(());
+    };
+
+    let mut last_error = None;
+    for _ in 0..25 {
+        match management_http_request(
+            port,
+            &management_key,
+            "POST",
+            "/v0/management/usage/import",
+            Some(&body),
+        ) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err);
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "导入使用统计备份失败".to_string()))
+}
+
+fn usage_management_context(dirs: &AppDirs) -> Result<Option<(u16, String)>, String> {
+    let stored = read_stored_state(dirs)?;
+    let Some(active_id) = stored.active_version.as_deref() else {
+        return Ok(None);
+    };
+    let runtime = runtime_by_id(dirs, active_id)?;
+    let config_path = ensure_workspace_config(dirs, &runtime)?;
+    let Some(management_key) = management_key_for_config(&stored, &config_path)? else {
+        return Ok(None);
+    };
+    let content = fs::read_to_string(&config_path).map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => "配置文件还没有初始化".to_string(),
+        _ => format!("读取配置文件失败: {err}"),
+    })?;
+    let Some(port) = read_port_from_content(&content)? else {
+        return Ok(None);
+    };
+    Ok(Some((port, management_key)))
+}
+
+fn usage_backup_path(dirs: &AppDirs) -> PathBuf {
+    dirs.app_data_dir.join(USAGE_BACKUP_FILE)
+}
+
+fn should_write_usage_backup(backup_path: &Path, exported: &[u8]) -> bool {
+    usage_total_requests(exported) > 0 || !backup_path.exists()
+}
+
+fn usage_total_requests(data: &[u8]) -> i64 {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/usage/total_requests")
+                .and_then(|count| count.as_i64())
+        })
+        .unwrap_or(0)
+}
+
+fn management_http_request(
+    port: u16,
+    management_key: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if management_key.contains('\r') || management_key.contains('\n') {
+        return Err("管理密钥包含非法换行字符".to_string());
+    }
+
+    let body = body.unwrap_or(&[]);
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {management_key}\r\nAccept: application/json\r\nConnection: close\r\n"
+    );
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|err| format!("连接管理接口失败: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("设置读取超时失败: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("设置写入超时失败: {err}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|err| format!("发送管理请求失败: {err}"))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|err| format!("读取管理响应失败: {err}"))?;
+    parse_http_response(&response)
+}
+
+fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, String> {
+    let header_end = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .ok_or_else(|| "管理接口响应格式无效".to_string())?;
+    let header_bytes = &response[..header_end];
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|err| format!("解析响应头失败: {err}"))?;
+    let status_line = header_text
+        .lines()
+        .next()
+        .ok_or_else(|| "管理接口缺少响应状态".to_string())?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| "管理接口响应状态无效".to_string())?;
+    let body = &response[(header_end + 4)..];
+    let decoded_body = if header_text
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+
+    if (200..300).contains(&status) {
+        return Ok(decoded_body);
+    }
+
+    let message = String::from_utf8_lossy(&decoded_body);
+    Err(format!("管理接口请求失败: HTTP {status} {message}"))
+}
+
+fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut cursor = 0;
+
+    loop {
+        let line_end = body[cursor..]
+            .windows(2)
+            .position(|part| part == b"\r\n")
+            .ok_or_else(|| "分块响应格式无效".to_string())?;
+        let size_line = std::str::from_utf8(&body[cursor..(cursor + line_end)])
+            .map_err(|err| format!("解析分块长度失败: {err}"))?;
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|err| format!("解析分块长度失败: {err}"))?;
+        cursor += line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if cursor + size > body.len() {
+            return Err("分块响应内容不完整".to_string());
+        }
+        output.extend_from_slice(&body[cursor..(cursor + size)]);
+        cursor += size;
+        if body.get(cursor..(cursor + 2)) == Some(b"\r\n") {
+            cursor += 2;
+        }
+        if cursor >= body.len() {
+            break;
+        }
+    }
+
+    Ok(output)
 }
 
 fn bootstrap_default_runtime(app: &AppHandle) -> Result<(), String> {
