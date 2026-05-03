@@ -11,16 +11,31 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tar::{Archive, Builder};
-use tauri::{path::BaseDirectory, AppHandle, Manager, State};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
 const BINARY_BASENAME: &str = "cli-proxy-api";
 const DEFAULT_CONFIG_CACHE: &str = "default-config.yaml";
 const DEFAULT_AUTH_DIR: &str = "~/.cli-proxy-api";
 const DEFAULT_RUNTIME_VERSION: &str = "6.9.36";
 const USAGE_BACKUP_FILE: &str = "usage-statistics.json";
+const CLIPROXYAPI_REPOSITORY_URL: &str = "https://github.com/router-for-me/CLIProxyAPI";
+const CLIPROXYAPI_RELEASES_URL: &str = "https://github.com/router-for-me/CLIProxyAPI/releases";
+const CLIPROXYAPI_LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest";
+const GITHUB_USER_AGENT: &str = "CLIProxyAPI-Desktop";
+const DOWNLOAD_PROGRESS_EVENT: &str = "cliproxyapi-download-progress";
 
 #[derive(Default)]
 struct ProcessState(Mutex<Option<Child>>);
+
+#[derive(Default)]
+struct DownloadState(Mutex<DownloadControl>);
+
+#[derive(Default)]
+struct DownloadControl {
+    active_id: Option<String>,
+    cancel_requested: bool,
+}
 
 #[derive(Debug, Clone)]
 struct PackageInfo {
@@ -89,11 +104,49 @@ struct ConfigFileInfo {
     local_management_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    current_version: Option<String>,
+    latest_version: String,
+    target: String,
+    release_url: String,
+    download_url: Option<String>,
+    asset_name: Option<String>,
+    has_update: bool,
+    latest_installed: bool,
+    latest_active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgressEvent {
+    status: String,
+    asset_name: String,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    message: Option<String>,
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(ProcessState::default())
+        .manage(DownloadState::default())
         .setup(|app| {
             if let Err(err) = bootstrap_default_runtime(app.handle()) {
                 eprintln!("failed to bootstrap bundled CLIProxyAPI runtime: {err}");
@@ -114,7 +167,12 @@ pub fn run() {
             import_auth_archive,
             save_config_file,
             restore_default_config,
-            open_management_web
+            open_management_web,
+            open_cli_proxy_repository,
+            open_cli_proxy_releases,
+            check_cli_proxy_update,
+            download_cli_proxy_update,
+            cancel_cli_proxy_download
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
@@ -405,6 +463,422 @@ fn open_management_web(app: AppHandle) -> Result<(), String> {
         .management_url
         .ok_or_else(|| "配置文件缺少可访问的 Web 端口".to_string())?;
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|err| format!("打开浏览器失败: {err}"))
+}
+
+#[tauri::command]
+fn open_cli_proxy_repository() -> Result<(), String> {
+    tauri_plugin_opener::open_url(CLIPROXYAPI_REPOSITORY_URL, None::<&str>)
+        .map_err(|err| format!("打开 CLIProxyAPI 源码地址失败: {err}"))
+}
+
+#[tauri::command]
+fn open_cli_proxy_releases() -> Result<(), String> {
+    tauri_plugin_opener::open_url(CLIPROXYAPI_RELEASES_URL, None::<&str>)
+        .map_err(|err| format!("打开 CLIProxyAPI 下载地址失败: {err}"))
+}
+
+#[tauri::command]
+fn check_cli_proxy_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    let dirs = AppDirs::new(&app)?;
+    let release = fetch_latest_release()?;
+    update_info_from_release(&dirs, &release)
+}
+
+#[tauri::command]
+async fn download_cli_proxy_update(app: AppHandle) -> Result<DesktopState, String> {
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let process = task_app.state::<ProcessState>();
+        let download = task_app.state::<DownloadState>();
+        download_cli_proxy_update_impl(task_app.clone(), process, download)
+    })
+    .await
+    .map_err(|err| format!("下载任务执行失败: {err}"))?
+}
+
+#[tauri::command]
+fn cancel_cli_proxy_download(download: State<'_, DownloadState>) -> Result<(), String> {
+    let mut guard = download
+        .0
+        .lock()
+        .map_err(|_| "下载状态锁已损坏".to_string())?;
+    if guard.active_id.is_some() {
+        guard.cancel_requested = true;
+    }
+    Ok(())
+}
+
+fn download_cli_proxy_update_impl(
+    app: AppHandle,
+    process: State<'_, ProcessState>,
+    download: State<'_, DownloadState>,
+) -> Result<DesktopState, String> {
+    if service_pid_for_state(&app, &process)?.is_some() {
+        return Err("请先停止当前服务，再下载并切换 CLIProxyAPI 版本包".to_string());
+    }
+
+    let download_id = begin_download(&download)?;
+    let result: Result<DesktopState, String> = (|| {
+        let dirs = AppDirs::new(&app)?;
+        let release = fetch_latest_release()?;
+        let update = update_info_from_release(&dirs, &release)?;
+        let asset_name = update
+            .asset_name
+            .ok_or_else(|| format!("最新版本没有匹配 {} 的安装包", update.target))?;
+        let download_url = update
+            .download_url
+            .ok_or_else(|| format!("最新版本没有匹配 {} 的下载地址", update.target))?;
+        let package_path = download_release_asset(
+            &app,
+            &download,
+            &download_id,
+            &dirs,
+            &asset_name,
+            &download_url,
+        )?;
+        emit_download_progress(
+            &app,
+            "installing",
+            &asset_name,
+            0,
+            None,
+            Some("正在自动导入"),
+        )?;
+        install_runtime_package(&app, &package_path, true)?;
+        let next_state = build_desktop_state(&app, &process)?;
+        emit_download_progress(&app, "done", &asset_name, 0, None, Some("下载导入完成"))?;
+        Ok(next_state)
+    })();
+
+    if let Err(message) = &result {
+        if !message.contains("下载已取消") {
+            let _ = emit_download_progress(&app, "failed", "", 0, None, Some(message));
+        }
+    }
+    clear_download(&download, &download_id);
+    result
+}
+
+fn fetch_latest_release() -> Result<GitHubRelease, String> {
+    let client = github_client()?;
+    let response = client
+        .get(CLIPROXYAPI_LATEST_RELEASE_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|err| format!("检测 CLIProxyAPI 更新失败: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = response.text().unwrap_or_default();
+        return Err(format!(
+            "检测 CLIProxyAPI 更新失败: HTTP {status} {message}"
+        ));
+    }
+
+    response
+        .json()
+        .map_err(|err| format!("解析 CLIProxyAPI 更新信息失败: {err}"))
+}
+
+fn github_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(GITHUB_USER_AGENT)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|err| format!("初始化下载客户端失败: {err}"))
+}
+
+fn update_info_from_release(dirs: &AppDirs, release: &GitHubRelease) -> Result<UpdateInfo, String> {
+    let latest_version = normalize_release_version(&release.tag_name);
+    let target_aliases = current_package_target_aliases();
+    let target = target_aliases.join(" / ");
+    let stored = read_stored_state(dirs)?;
+    let runtimes = list_runtimes(dirs)?;
+    let active_runtime = stored
+        .active_version
+        .as_deref()
+        .and_then(|id| runtimes.iter().find(|runtime| runtime.id == id));
+    let current_version = active_runtime.map(|runtime| runtime.version.clone());
+    let latest_installed = runtimes.iter().any(|runtime| {
+        normalize_release_version(&runtime.version) == latest_version
+            && target_aliases
+                .iter()
+                .any(|target| target == &runtime.target)
+    });
+    let latest_active = active_runtime.is_some_and(|runtime| {
+        normalize_release_version(&runtime.version) == latest_version
+            && target_aliases
+                .iter()
+                .any(|target| target == &runtime.target)
+    });
+    let asset = release_asset_for_target(release, &latest_version, &target_aliases);
+    let has_update = current_version
+        .as_deref()
+        .map_or(asset.is_some(), |version| {
+            asset.is_some() && !latest_installed && is_newer_version(&latest_version, version)
+        });
+
+    Ok(UpdateInfo {
+        current_version,
+        latest_version,
+        target,
+        release_url: release.html_url.clone(),
+        download_url: asset.map(|asset| asset.browser_download_url.clone()),
+        asset_name: asset.map(|asset| asset.name.clone()),
+        has_update,
+        latest_installed,
+        latest_active,
+    })
+}
+
+fn release_asset_for_target<'a>(
+    release: &'a GitHubRelease,
+    version: &str,
+    targets: &[String],
+) -> Option<&'a GitHubAsset> {
+    let exact_names = targets
+        .iter()
+        .flat_map(|target| {
+            [
+                format!("CLIProxyAPI_{version}_{target}.tar.gz"),
+                format!("CLIProxyAPI_{version}_{target}.tgz"),
+                format!("CLIProxyAPI_{version}_{target}.zip"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    release
+        .assets
+        .iter()
+        .find(|asset| exact_names.iter().any(|name| name == &asset.name))
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                let name = asset.name.as_str();
+                is_runtime_archive_name(name)
+                    && name.contains("CLIProxyAPI")
+                    && name.contains(version)
+                    && targets.iter().any(|target| name.contains(target))
+            })
+        })
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                let name = asset.name.as_str();
+                is_runtime_archive_name(name)
+                    && name.contains("CLIProxyAPI")
+                    && targets.iter().any(|target| name.contains(target))
+            })
+        })
+}
+
+fn is_runtime_archive_name(name: &str) -> bool {
+    name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".zip")
+}
+
+fn begin_download(download: &State<'_, DownloadState>) -> Result<String, String> {
+    let id = format!("{}-{}", std::process::id(), unix_timestamp()?);
+    let mut guard = download
+        .0
+        .lock()
+        .map_err(|_| "下载状态锁已损坏".to_string())?;
+    if guard.active_id.is_some() {
+        return Err("已有下载任务正在进行".to_string());
+    }
+    guard.active_id = Some(id.clone());
+    guard.cancel_requested = false;
+    Ok(id)
+}
+
+fn clear_download(download: &State<'_, DownloadState>, download_id: &str) {
+    if let Ok(mut guard) = download.0.lock() {
+        if guard.active_id.as_deref() == Some(download_id) {
+            guard.active_id = None;
+            guard.cancel_requested = false;
+        }
+    }
+}
+
+fn is_download_cancelled(
+    download: &State<'_, DownloadState>,
+    download_id: &str,
+) -> Result<bool, String> {
+    let guard = download
+        .0
+        .lock()
+        .map_err(|_| "下载状态锁已损坏".to_string())?;
+    Ok(guard.active_id.as_deref() == Some(download_id) && guard.cancel_requested)
+}
+
+fn emit_download_progress(
+    app: &AppHandle,
+    status: &str,
+    asset_name: &str,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    message: Option<&str>,
+) -> Result<(), String> {
+    app.emit(
+        DOWNLOAD_PROGRESS_EVENT,
+        DownloadProgressEvent {
+            status: status.to_string(),
+            asset_name: asset_name.to_string(),
+            downloaded_bytes,
+            total_bytes,
+            message: message.map(ToString::to_string),
+        },
+    )
+    .map_err(|err| format!("发送下载进度失败: {err}"))
+}
+
+fn download_release_asset(
+    app: &AppHandle,
+    download: &State<'_, DownloadState>,
+    download_id: &str,
+    dirs: &AppDirs,
+    asset_name: &str,
+    download_url: &str,
+) -> Result<PathBuf, String> {
+    let file_name = safe_download_file_name(asset_name)?;
+    let download_dir = dirs.app_data_dir.join("downloads");
+    fs::create_dir_all(&download_dir).map_err(|err| format!("创建下载目录失败: {err}"))?;
+    let package_path = download_dir.join(&file_name);
+    let temp_path = download_dir.join(format!("{file_name}.download"));
+
+    let result = (|| {
+        emit_download_progress(app, "starting", asset_name, 0, None, Some("准备下载"))?;
+        let client = github_client()?;
+        let mut response = client
+            .get(download_url)
+            .header("Accept", "application/octet-stream")
+            .send()
+            .map_err(|err| format!("下载 CLIProxyAPI 安装包失败: {err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().unwrap_or_default();
+            return Err(format!(
+                "下载 CLIProxyAPI 安装包失败: HTTP {status} {message}"
+            ));
+        }
+        let total_bytes = response.content_length();
+        emit_download_progress(app, "downloading", asset_name, 0, total_bytes, None)?;
+
+        let mut file =
+            File::create(&temp_path).map_err(|err| format!("创建下载临时文件失败: {err}"))?;
+        let mut downloaded_bytes = 0_u64;
+        let mut last_emit_bytes = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if is_download_cancelled(download, download_id)? {
+                emit_download_progress(
+                    app,
+                    "cancelled",
+                    asset_name,
+                    downloaded_bytes,
+                    total_bytes,
+                    Some("下载已取消"),
+                )?;
+                return Err("下载已取消".to_string());
+            }
+
+            let read = response
+                .read(&mut buffer)
+                .map_err(|err| format!("读取安装包失败: {err}"))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|err| format!("写入安装包失败: {err}"))?;
+            downloaded_bytes += read as u64;
+
+            if downloaded_bytes == total_bytes.unwrap_or(0)
+                || downloaded_bytes.saturating_sub(last_emit_bytes) >= 512 * 1024
+            {
+                emit_download_progress(
+                    app,
+                    "downloading",
+                    asset_name,
+                    downloaded_bytes,
+                    total_bytes,
+                    None,
+                )?;
+                last_emit_bytes = downloaded_bytes;
+            }
+        }
+        file.flush()
+            .map_err(|err| format!("刷新安装包文件失败: {err}"))?;
+        emit_download_progress(
+            app,
+            "downloading",
+            asset_name,
+            downloaded_bytes,
+            total_bytes,
+            None,
+        )?;
+        fs::rename(&temp_path, &package_path).map_err(|err| format!("保存安装包失败: {err}"))?;
+        Ok(package_path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn safe_download_file_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("下载文件名为空".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("下载文件名包含路径分隔符".to_string());
+    }
+
+    let path = Path::new(trimmed);
+    let components = path.components().collect::<Vec<_>>();
+    if components.len() != 1 || !matches!(components[0], Component::Normal(_)) {
+        return Err("下载文件名不安全".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_release_version(tag: &str) -> String {
+    let trimmed = tag.trim();
+    let trimmed = trimmed.trim_start_matches(['v', 'V']);
+    if trimmed
+        .chars()
+        .next()
+        .is_some_and(|value| value.is_ascii_digit())
+    {
+        return trimmed.to_string();
+    }
+
+    let Some(start) = trimmed.find(|value: char| value.is_ascii_digit()) else {
+        return trimmed.to_string();
+    };
+    trimmed[start..].to_string()
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let latest_parts = version_number_parts(latest);
+    let current_parts = version_number_parts(current);
+    if latest_parts.is_empty() || current_parts.is_empty() {
+        return normalize_release_version(latest) != normalize_release_version(current);
+    }
+
+    let length = latest_parts.len().max(current_parts.len());
+    for index in 0..length {
+        let left = latest_parts.get(index).copied().unwrap_or(0);
+        let right = current_parts.get(index).copied().unwrap_or(0);
+        if left != right {
+            return left > right;
+        }
+    }
+    false
+}
+
+fn version_number_parts(value: &str) -> Vec<u64> {
+    value
+        .split(|part: char| !part.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 fn backup_usage_statistics(
@@ -698,10 +1172,14 @@ fn install_runtime_package(
     }
 
     let package = parse_package_info(package_path)?;
-    let expected_target = current_package_target();
-    if package.target != expected_target {
+    let expected_targets = current_package_target_aliases();
+    if !expected_targets
+        .iter()
+        .any(|target| target == &package.target)
+    {
         return Err(format!(
-            "版本包平台不匹配: 当前平台需要 {expected_target}, 但包是 {}",
+            "版本包平台不匹配: 当前平台需要 {}, 但包是 {}",
+            expected_targets.join(" 或 "),
             package.target
         ));
     }
@@ -768,6 +1246,17 @@ fn install_runtime_package(
 }
 
 fn unpack_archive(package_path: &Path, target_dir: &Path) -> Result<(), String> {
+    let file_name = package_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "版本包文件名无效".to_string())?;
+    if file_name.ends_with(".zip") {
+        return unpack_zip_archive(package_path, target_dir);
+    }
+    unpack_tar_gz_archive(package_path, target_dir)
+}
+
+fn unpack_tar_gz_archive(package_path: &Path, target_dir: &Path) -> Result<(), String> {
     let file = File::open(package_path).map_err(|err| format!("打开版本包失败: {err}"))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
@@ -800,6 +1289,43 @@ fn unpack_archive(package_path: &Path, target_dir: &Path) -> Result<(), String> 
                 .unpack(&output_path)
                 .map_err(|err| format!("解包文件失败: {err}"))?;
         }
+    }
+
+    Ok(())
+}
+
+fn unpack_zip_archive(package_path: &Path, target_dir: &Path) -> Result<(), String> {
+    let file = File::open(package_path).map_err(|err| format!("打开版本包失败: {err}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|err| format!("读取 zip 版本包失败: {err}"))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("读取 zip 版本包条目失败: {err}"))?;
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err("版本包不能包含符号链接".to_string());
+        }
+
+        let relative_path = safe_relative_path(Path::new(entry.name()))?;
+        let output_path = target_dir.join(relative_path);
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path).map_err(|err| format!("创建目录失败: {err}"))?;
+            continue;
+        }
+        if !entry.is_file() {
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("创建目录失败: {err}"))?;
+        }
+        let mut output =
+            File::create(&output_path).map_err(|err| format!("创建解包文件失败: {err}"))?;
+        io::copy(&mut entry, &mut output).map_err(|err| format!("解包 zip 文件失败: {err}"))?;
     }
 
     Ok(())
@@ -1649,13 +2175,14 @@ fn parse_package_info(path: &Path) -> Result<PackageInfo, String> {
     let base_name = file_name
         .strip_suffix(".tar.gz")
         .or_else(|| file_name.strip_suffix(".tgz"))
-        .ok_or_else(|| "版本包必须是 .tar.gz 或 .tgz 文件".to_string())?;
+        .or_else(|| file_name.strip_suffix(".zip"))
+        .ok_or_else(|| "版本包必须是 .tar.gz、.tgz 或 .zip 文件".to_string())?;
     let descriptor = base_name
         .strip_prefix("CLIProxyAPI_")
-        .ok_or_else(|| "版本包命名需匹配 CLIProxyAPI_<version>_<os>_<arch>.tar.gz".to_string())?;
+        .ok_or_else(|| "版本包命名需匹配 CLIProxyAPI_<version>_<os>_<arch>".to_string())?;
     let parts = descriptor.split('_').collect::<Vec<_>>();
     if parts.len() != 3 {
-        return Err("版本包命名需匹配 CLIProxyAPI_<version>_<os>_<arch>.tar.gz".to_string());
+        return Err("版本包命名需匹配 CLIProxyAPI_<version>_<os>_<arch>".to_string());
     }
     let version = parts[0].trim();
     let target_os = parts[1].trim();
@@ -1701,6 +2228,21 @@ fn current_package_target() -> String {
         other => other,
     };
     format!("{os}_{arch}")
+}
+
+fn current_package_target_aliases() -> Vec<String> {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let mut targets = vec![current_package_target()];
+    if std::env::consts::ARCH == "aarch64" {
+        let aarch64_target = format!("{os}_aarch64");
+        if !targets.iter().any(|target| target == &aarch64_target) {
+            targets.push(aarch64_target);
+        }
+    }
+    targets
 }
 
 fn unix_timestamp() -> Result<u64, String> {

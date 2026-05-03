@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirm as confirmDialog, open, save } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, message as messageDialog, open, save } from "@tauri-apps/plugin-dialog";
 import {
   CheckCircle2,
   Download,
@@ -53,7 +54,31 @@ type DesktopState = {
   config?: ConfigFileInfo | null;
 };
 
+type UpdateInfo = {
+  currentVersion?: string | null;
+  latestVersion: string;
+  target: string;
+  releaseUrl: string;
+  downloadUrl?: string | null;
+  assetName?: string | null;
+  hasUpdate: boolean;
+  latestInstalled: boolean;
+  latestActive: boolean;
+};
+
+type DownloadProgressStatus = "starting" | "downloading" | "installing" | "done" | "cancelled" | "failed";
+
+type DownloadProgress = {
+  status: DownloadProgressStatus;
+  assetName: string;
+  downloadedBytes: number;
+  totalBytes?: number | null;
+  message?: string | null;
+};
+
 const LANGUAGE_STORAGE_KEY = "cliproxyapi.desktop.language";
+const DOWNLOAD_PROGRESS_EVENT = "cliproxyapi-download-progress";
+const DOWNLOAD_DONE_HIDE_MS = 2000;
 
 const LANGUAGE_OPTIONS = [
   { code: "zh-CN", label: "中文", locale: "zh-CN" },
@@ -78,7 +103,11 @@ type BusyKey =
   | "save"
   | "browser"
   | "restore"
-  | "delete";
+  | "delete"
+  | "openSource"
+  | "openRelease"
+  | "checkUpdate"
+  | "downloadUpdate";
 
 type Translation = {
   appSubtitle: string;
@@ -125,6 +154,21 @@ type Translation = {
   cannotDelete: string;
   delete: string;
   emptyVersions: string;
+  sourceCode: string;
+  releaseDownloads: string;
+  checkUpdate: string;
+  downloadLatest: string;
+  checkingUpdate: string;
+  cancelDownload: string;
+  downloadPreparing: string;
+  downloadInstalling: string;
+  downloadDone: string;
+  downloadCanceled: string;
+  updateAvailable: (version: string, target: string) => string;
+  latestAlreadyInstalled: (version: string) => string;
+  noUpdateAvailable: (version: string) => string;
+  noPlatformPackage: (version: string, target: string) => string;
+  downloadProgress: (downloaded: string, total?: string) => string;
   cliPackageFilter: string;
   authArchiveFilter: string;
   restoreUnavailable: string;
@@ -193,7 +237,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     cannotDelete: "不可删除",
     delete: "删除",
     emptyVersions: "暂无版本",
-    cliPackageFilter: "CLIProxyAPI tar.gz",
+    sourceCode: "源码地址",
+    releaseDownloads: "下载地址",
+    checkUpdate: "检测更新",
+    downloadLatest: "下载导入",
+    checkingUpdate: "正在检测 CLIProxyAPI 最新版本...",
+    cancelDownload: "取消下载",
+    downloadPreparing: "正在准备下载...",
+    downloadInstalling: "下载完成，正在自动导入...",
+    downloadDone: "下载导入完成",
+    downloadCanceled: "下载已取消",
+    updateAvailable: (version, target) => `发现新版本 v${version}，已匹配 ${target} 安装包。`,
+    latestAlreadyInstalled: (version) => `最新版本 v${version} 已下载并导入，可在列表中点击“设为当前”切换。`,
+    noUpdateAvailable: (version) => `当前已是最新版本 v${version}。`,
+    noPlatformPackage: (version, target) => `最新版本 v${version} 暂无 ${target} 安装包。`,
+    downloadProgress: (downloaded, total) => (total ? `已下载 ${downloaded} / ${total}` : `已下载 ${downloaded}`),
+    cliPackageFilter: "CLIProxyAPI 安装包",
     authArchiveFilter: "认证压缩包",
     restoreUnavailable: "还没有可恢复默认配置的当前版本",
     restoreStopFirst: "请先停止服务，再恢复默认配置",
@@ -228,6 +287,10 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
       browser: "打开浏览器中",
       restore: "恢复中",
       delete: "删除中",
+      openSource: "打开源码地址中",
+      openRelease: "打开下载地址中",
+      checkUpdate: "检测更新中",
+      downloadUpdate: "下载导入中",
     },
   },
   "zh-TW": {
@@ -275,7 +338,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     cannotDelete: "不可刪除",
     delete: "刪除",
     emptyVersions: "尚無版本",
-    cliPackageFilter: "CLIProxyAPI tar.gz",
+    sourceCode: "原始碼位址",
+    releaseDownloads: "下載位址",
+    checkUpdate: "檢查更新",
+    downloadLatest: "下載匯入",
+    checkingUpdate: "正在檢查 CLIProxyAPI 最新版本...",
+    cancelDownload: "取消下載",
+    downloadPreparing: "正在準備下載...",
+    downloadInstalling: "下載完成，正在自動匯入...",
+    downloadDone: "下載匯入完成",
+    downloadCanceled: "下載已取消",
+    updateAvailable: (version, target) => `發現新版本 v${version}，已匹配 ${target} 安裝包。`,
+    latestAlreadyInstalled: (version) => `最新版本 v${version} 已下載並匯入，可在列表中點擊「設為目前」切換。`,
+    noUpdateAvailable: (version) => `目前已是最新版本 v${version}。`,
+    noPlatformPackage: (version, target) => `最新版本 v${version} 暫無 ${target} 安裝包。`,
+    downloadProgress: (downloaded, total) => (total ? `已下載 ${downloaded} / ${total}` : `已下載 ${downloaded}`),
+    cliPackageFilter: "CLIProxyAPI 安裝包",
     authArchiveFilter: "認證壓縮包",
     restoreUnavailable: "尚無可還原預設設定的目前版本",
     restoreStopFirst: "請先停止服務，再還原預設設定",
@@ -310,6 +388,10 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
       browser: "開啟瀏覽器中",
       restore: "還原中",
       delete: "刪除中",
+      openSource: "開啟原始碼位址中",
+      openRelease: "開啟下載位址中",
+      checkUpdate: "檢查更新中",
+      downloadUpdate: "下載匯入中",
     },
   },
   en: {
@@ -357,7 +439,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     cannotDelete: "Locked",
     delete: "Delete",
     emptyVersions: "No versions installed",
-    cliPackageFilter: "CLIProxyAPI tar.gz",
+    sourceCode: "Source",
+    releaseDownloads: "Downloads",
+    checkUpdate: "Check Update",
+    downloadLatest: "Download Import",
+    checkingUpdate: "Checking the latest CLIProxyAPI version...",
+    cancelDownload: "Cancel Download",
+    downloadPreparing: "Preparing download...",
+    downloadInstalling: "Download complete. Importing automatically...",
+    downloadDone: "Download and import complete",
+    downloadCanceled: "Download canceled",
+    updateAvailable: (version, target) => `New version v${version} found with a ${target} package.`,
+    latestAlreadyInstalled: (version) => `Latest version v${version} is already downloaded and imported. Set it current from the list to switch.`,
+    noUpdateAvailable: (version) => `Already on the latest version v${version}.`,
+    noPlatformPackage: (version, target) => `Latest version v${version} has no ${target} package.`,
+    downloadProgress: (downloaded, total) => (total ? `Downloaded ${downloaded} / ${total}` : `Downloaded ${downloaded}`),
+    cliPackageFilter: "CLIProxyAPI package",
     authArchiveFilter: "Auth archive",
     restoreUnavailable: "There is no current version to restore from",
     restoreStopFirst: "Stop the service before restoring the default config",
@@ -392,6 +489,10 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
       browser: "Opening browser",
       restore: "Restoring",
       delete: "Deleting",
+      openSource: "Opening source URL",
+      openRelease: "Opening download URL",
+      checkUpdate: "Checking updates",
+      downloadUpdate: "Downloading and importing",
     },
   },
   ru: {
@@ -439,7 +540,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     cannotDelete: "Нельзя удалить",
     delete: "Удалить",
     emptyVersions: "Версий пока нет",
-    cliPackageFilter: "CLIProxyAPI tar.gz",
+    sourceCode: "Исходный код",
+    releaseDownloads: "Загрузки",
+    checkUpdate: "Проверить",
+    downloadLatest: "Скачать",
+    checkingUpdate: "Проверка последней версии CLIProxyAPI...",
+    cancelDownload: "Отменить",
+    downloadPreparing: "Подготовка загрузки...",
+    downloadInstalling: "Загрузка завершена. Автоимпорт...",
+    downloadDone: "Загрузка и импорт завершены",
+    downloadCanceled: "Загрузка отменена",
+    updateAvailable: (version, target) => `Найдена новая версия v${version} с пакетом ${target}.`,
+    latestAlreadyInstalled: (version) => `Последняя версия v${version} уже загружена и импортирована. Сделайте ее текущей в списке.`,
+    noUpdateAvailable: (version) => `Уже установлена последняя версия v${version}.`,
+    noPlatformPackage: (version, target) => `Для последней версии v${version} нет пакета ${target}.`,
+    downloadProgress: (downloaded, total) => (total ? `Загружено ${downloaded} / ${total}` : `Загружено ${downloaded}`),
+    cliPackageFilter: "Пакет CLIProxyAPI",
     authArchiveFilter: "Архив авторизации",
     restoreUnavailable: "Нет текущей версии для восстановления конфигурации",
     restoreStopFirst: "Сначала остановите сервис, затем восстановите конфигурацию",
@@ -474,6 +590,10 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
       browser: "Открытие браузера",
       restore: "Сброс",
       delete: "Удаление",
+      openSource: "Открытие исходного кода",
+      openRelease: "Открытие загрузок",
+      checkUpdate: "Проверка обновлений",
+      downloadUpdate: "Загрузка и импорт",
     },
   },
 };
@@ -487,6 +607,11 @@ export function App() {
   const [managementKeyDraft, setManagementKeyDraft] = useState("");
   const [configDirty, setConfigDirty] = useState(false);
   const [language, setLanguage] = useState<LanguageCode>(readStoredLanguage);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [versionNotice, setVersionNotice] = useState<string | null>(null);
+  const [versionNoticeKind, setVersionNoticeKind] = useState<"info" | "success" | "error">("info");
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const closeAllowedRef = useRef(false);
   const closeInProgressRef = useRef(false);
 
@@ -536,6 +661,55 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
   }, [language]);
+
+  useEffect(() => {
+    if (downloadProgress?.status !== "done") {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setDownloadProgress((current) => (current?.status === "done" ? null : current));
+      setVersionNotice((current) => (current === t.downloadDone ? null : current));
+    }, DOWNLOAD_DONE_HIDE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [downloadProgress?.status, t.downloadDone]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<DownloadProgress>(DOWNLOAD_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      setDownloadProgress(event.payload);
+      if (event.payload.status === "installing") {
+        setVersionNotice(t.downloadInstalling);
+        setVersionNoticeKind("info");
+      } else if (event.payload.status === "done") {
+        setVersionNotice(t.downloadDone);
+        setVersionNoticeKind("success");
+      } else if (event.payload.status === "cancelled") {
+        setVersionNotice(t.downloadCanceled);
+        setVersionNoticeKind("info");
+      } else if (event.payload.status === "failed") {
+        setVersionNotice(event.payload.message ?? "");
+        setVersionNoticeKind("error");
+      }
+    }).then((handler) => {
+      if (disposed) {
+        handler();
+        return;
+      }
+      unlisten = handler;
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [t]);
 
   useEffect(() => {
     const appWindow = getCurrentWindow();
@@ -604,7 +778,7 @@ export function App() {
       filters: [
         {
           name: t.cliPackageFilter,
-          extensions: ["gz", "tgz"],
+          extensions: ["gz", "tgz", "zip"],
         },
       ],
     });
@@ -619,6 +793,9 @@ export function App() {
       setConfigDirty(false);
       syncConfigForm(nextState.config?.content ?? "");
       setManagementKeyDraft(nextState.config?.localManagementKey ?? "");
+      setUpdateInfo(null);
+      setVersionNotice(null);
+      setDownloadProgress(null);
     });
   };
 
@@ -629,6 +806,9 @@ export function App() {
       setConfigDirty(false);
       syncConfigForm(nextState.config?.content ?? "");
       setManagementKeyDraft(nextState.config?.localManagementKey ?? "");
+      setUpdateInfo(null);
+      setVersionNotice(null);
+      setDownloadProgress(null);
     });
   };
 
@@ -727,6 +907,9 @@ export function App() {
       setConfigDirty(false);
       syncConfigForm(nextState.config?.content ?? "");
       setManagementKeyDraft(nextState.config?.localManagementKey ?? "");
+      setUpdateInfo(null);
+      setVersionNotice(null);
+      setDownloadProgress(null);
     });
   };
 
@@ -797,6 +980,97 @@ export function App() {
     });
   };
 
+  const openCliProxyRepository = async () => {
+    await runCommand("openSource", async () => {
+      await invoke("open_cli_proxy_repository");
+    });
+  };
+
+  const openCliProxyReleases = async () => {
+    await runCommand("openRelease", async () => {
+      await invoke("open_cli_proxy_releases");
+    });
+  };
+
+  const checkCliProxyUpdate = async () => {
+    if (checkingUpdate) {
+      return;
+    }
+
+    setCheckingUpdate(true);
+    setError(null);
+    setVersionNotice(t.checkingUpdate);
+    setVersionNoticeKind("info");
+    setDownloadProgress(null);
+    try {
+      const nextUpdate = await invoke<UpdateInfo>("check_cli_proxy_update");
+      const notice = formatUpdateMessage(nextUpdate, t);
+      setUpdateInfo(nextUpdate);
+      setVersionNotice(notice);
+      setVersionNoticeKind(nextUpdate.hasUpdate ? "success" : "info");
+      await messageDialog(notice, {
+        title: t.checkUpdate,
+        kind: "info",
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setVersionNotice(message);
+      setVersionNoticeKind("error");
+      await messageDialog(message, {
+        title: t.checkUpdate,
+        kind: "error",
+      }).catch(() => undefined);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const downloadCliProxyUpdate = async () => {
+    setVersionNotice(t.downloadPreparing);
+    setVersionNoticeKind("info");
+    setDownloadProgress({
+      status: "starting",
+      assetName: updateInfo?.assetName ?? "",
+      downloadedBytes: 0,
+      totalBytes: null,
+    });
+    try {
+      await runCommand("downloadUpdate", async () => {
+        const nextState = await invoke<DesktopState>("download_cli_proxy_update");
+        setState(nextState);
+        setConfigDirty(false);
+        syncConfigForm(nextState.config?.content ?? "");
+        setManagementKeyDraft(nextState.config?.localManagementKey ?? "");
+        const nextUpdate = await invoke<UpdateInfo>("check_cli_proxy_update").catch(() => null);
+        setUpdateInfo(nextUpdate);
+        setVersionNotice(t.downloadDone);
+        setVersionNoticeKind("success");
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("下载已取消")) {
+        setError(null);
+        setVersionNotice(t.downloadCanceled);
+        setVersionNoticeKind("info");
+        return;
+      }
+      setVersionNotice(message);
+      setVersionNoticeKind("error");
+    }
+  };
+
+  const cancelDownload = async () => {
+    try {
+      await invoke("cancel_cli_proxy_download");
+      setVersionNotice(t.downloadCanceled);
+      setVersionNoticeKind("info");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setVersionNotice(message);
+      setVersionNoticeKind("error");
+    }
+  };
+
   const updateConfigDraft = (content: string) => {
     setConfigDraft(content);
     setPortDraft(readTopLevelScalar(content, "port") ?? "");
@@ -815,6 +1089,10 @@ export function App() {
     setConfigDraft((current) => upsertNestedScalar(current, "remote-management", "secret-key", "", true));
     setConfigDirty(true);
   };
+
+  const canDownloadUpdate = Boolean(state && !state.service.running && busy === "idle" && !checkingUpdate && (!updateInfo || (updateInfo.downloadUrl && updateInfo.hasUpdate && !updateInfo.latestInstalled)));
+  const canCancelDownload = busy === "downloadUpdate" && Boolean(downloadProgress && ["starting", "downloading"].includes(downloadProgress.status));
+  const currentVersionNotice = versionNotice ?? (updateInfo ? formatUpdateMessage(updateInfo, t) : null);
 
   return (
     <main className="app-shell">
@@ -976,10 +1254,39 @@ export function App() {
         </article>
       </section>
 
+      {downloadProgress && (
+        <section className="download-progress-panel">
+          <DownloadProgressView progress={downloadProgress} t={t} onCancel={cancelDownload} canCancel={canCancelDownload} />
+        </section>
+      )}
+
       <section className="versions-panel">
-        <div className="section-heading">
-          <h2>{t.installedVersions}</h2>
-          <span>{state?.runtimes.length ?? 0}</span>
+        <div className="section-heading versions-heading">
+          <div className="section-heading-main">
+            <div className="section-title-row">
+              <h2>{t.installedVersions}</h2>
+              <span className="section-count">{state?.runtimes.length ?? 0}</span>
+            </div>
+            {currentVersionNotice && <p className={`update-message ${versionNoticeKind}`}>{currentVersionNotice}</p>}
+          </div>
+          <div className="version-heading-actions">
+            <button className="path-action" onClick={openCliProxyRepository} disabled={busy !== "idle"} title="https://github.com/router-for-me/CLIProxyAPI">
+              <ExternalLink size={15} />
+              <span>{t.sourceCode}</span>
+            </button>
+            <button className="path-action" onClick={openCliProxyReleases} disabled={busy !== "idle"} title="https://github.com/router-for-me/CLIProxyAPI/releases">
+              <ExternalLink size={15} />
+              <span>{t.releaseDownloads}</span>
+            </button>
+            <button className="path-action" onClick={checkCliProxyUpdate} disabled={busy !== "idle" || checkingUpdate} title={t.checkUpdate}>
+              <RefreshCw size={15} />
+              <span>{t.checkUpdate}</span>
+            </button>
+            <button className="path-action primary" onClick={downloadCliProxyUpdate} disabled={!canDownloadUpdate} title={updateInfo?.assetName ?? t.downloadLatest}>
+              <Download size={15} />
+              <span>{t.downloadLatest}</span>
+            </button>
+          </div>
         </div>
         <div className="version-table">
           <div className="table-row table-head">
@@ -1031,6 +1338,95 @@ export function App() {
       </section>
     </main>
   );
+}
+
+function DownloadProgressView({
+  progress,
+  t,
+  onCancel,
+  canCancel,
+}: {
+  progress: DownloadProgress;
+  t: Translation;
+  onCancel: () => void;
+  canCancel: boolean;
+}) {
+  const percent = downloadPercent(progress);
+  return (
+    <div className="download-progress">
+      <div className="download-progress-row">
+        <span>{formatDownloadProgress(progress, t)}</span>
+        {canCancel && (
+          <button className="download-cancel" onClick={onCancel} type="button">
+            <Square size={13} />
+            <span>{t.cancelDownload}</span>
+          </button>
+        )}
+      </div>
+      <div className="download-progress-track" aria-hidden="true">
+        <span style={{ width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function formatDownloadProgress(progress: DownloadProgress, t: Translation) {
+  if (progress.status === "starting") {
+    return t.downloadPreparing;
+  }
+  if (progress.status === "installing") {
+    return t.downloadInstalling;
+  }
+  if (progress.status === "done") {
+    return t.downloadDone;
+  }
+  if (progress.status === "cancelled") {
+    return t.downloadCanceled;
+  }
+  if (progress.status === "failed") {
+    return progress.message ?? "";
+  }
+  return t.downloadProgress(formatBytes(progress.downloadedBytes), progress.totalBytes ? formatBytes(progress.totalBytes) : undefined);
+}
+
+function downloadPercent(progress: DownloadProgress) {
+  if (progress.status === "done") {
+    return 100;
+  }
+  if (!progress.totalBytes || progress.totalBytes <= 0) {
+    return progress.status === "installing" ? 100 : 6;
+  }
+  return Math.max(3, Math.min(100, Math.round((progress.downloadedBytes / progress.totalBytes) * 100)));
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  let amount = value;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatUpdateMessage(updateInfo: UpdateInfo, t: Translation) {
+  if (!updateInfo.downloadUrl) {
+    return t.noPlatformPackage(updateInfo.latestVersion, updateInfo.target);
+  }
+  if (updateInfo.latestActive) {
+    return t.noUpdateAvailable(updateInfo.latestVersion);
+  }
+  if (updateInfo.latestInstalled) {
+    return t.latestAlreadyInstalled(updateInfo.latestVersion);
+  }
+  if (updateInfo.hasUpdate) {
+    return t.updateAvailable(updateInfo.latestVersion, updateInfo.target);
+  }
+  return t.noUpdateAvailable(updateInfo.latestVersion);
 }
 
 function formatInstalledAt(value: number, language: LanguageCode) {
