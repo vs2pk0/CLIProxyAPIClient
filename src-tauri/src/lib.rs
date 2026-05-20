@@ -454,19 +454,23 @@ fn import_auth_archive(
 }
 
 #[tauri::command]
-fn open_management_web(app: AppHandle) -> Result<(), String> {
+fn open_management_web(app: AppHandle, process: State<'_, ProcessState>) -> Result<(), String> {
     let dirs = AppDirs::new(&app)?;
     let runtime = active_runtime(&dirs)?;
     let config_path = ensure_workspace_config(&dirs, &runtime)?;
     let stored = read_stored_state(&dirs)?;
-    if detect_managed_service_pid(&dirs, &stored, &config_path)?.is_none() {
-        return Err("服务未运行，启动后再打开管理页".to_string());
-    }
     let management_key = management_key_for_config(&stored, &config_path)?;
     let config = config_info(&config_path, management_key)?;
     let url = config
         .management_url
+        .as_deref()
         .ok_or_else(|| "配置文件缺少可访问的 Web 端口".to_string())?;
+    if process_pid(&process)?.is_none()
+        && detect_managed_service_pid(&dirs, &stored, &config_path)?.is_none()
+        && !management_web_is_reachable(&config)
+    {
+        return Err("服务未运行，启动后再打开管理页".to_string());
+    }
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|err| format!("打开浏览器失败: {err}"))
 }
 
@@ -1452,6 +1456,20 @@ fn config_info(
         management_url,
         local_management_key,
     })
+}
+
+fn management_web_is_reachable(config: &ConfigFileInfo) -> bool {
+    let Some(port) = config.port else {
+        return false;
+    };
+    management_http_request(
+        port,
+        config.local_management_key.as_deref().unwrap_or_default(),
+        "GET",
+        "/management.html",
+        None,
+    )
+    .is_ok()
 }
 
 fn management_key_for_config(
