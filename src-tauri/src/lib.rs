@@ -1111,13 +1111,30 @@ fn bootstrap_default_runtime(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let default_package = default_package_name();
-    let package_path = app
-        .path()
-        .resolve(&default_package, BaseDirectory::Resource)
-        .map_err(|err| format!("定位内置版本包失败: {err}"))?;
+    let package_path = resolve_default_package_resource(app)?;
     install_runtime_package(app, &package_path, true)?;
     Ok(())
+}
+
+fn resolve_default_package_resource(app: &AppHandle) -> Result<PathBuf, String> {
+    let candidates = default_package_names();
+    let mut resolved_paths = Vec::new();
+
+    for candidate in &candidates {
+        let path = app
+            .path()
+            .resolve(candidate, BaseDirectory::Resource)
+            .map_err(|err| format!("定位内置版本包失败: {err}"))?;
+        if path.exists() {
+            return Ok(path);
+        }
+        resolved_paths.push(display_path(&path));
+    }
+
+    Err(format!(
+        "内置版本包不存在，已尝试: {}",
+        resolved_paths.join(", ")
+    ))
 }
 
 fn build_desktop_state(
@@ -1687,9 +1704,7 @@ fn resolve_auth_dir(dirs: &AppDirs, auth_dir: &str) -> Result<PathBuf, String> {
     };
 
     if value == "~" || value.starts_with("~/") || value.starts_with("~\\") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "无法定位用户主目录".to_string())?;
+        let home = user_home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
         let remainder = value
             .trim_start_matches('~')
             .trim_start_matches(['/', '\\'])
@@ -1707,6 +1722,33 @@ fn resolve_auth_dir(dirs: &AppDirs, auth_dir: &str) -> Result<PathBuf, String> {
     } else {
         Ok(dirs.workspace_dir.join(path))
     }
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(key)?;
+    if value.to_string_lossy().trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let joined = PathBuf::from(format!(
+                "{}{}",
+                drive.to_string_lossy(),
+                path.to_string_lossy()
+            ));
+            if joined.as_os_str().to_string_lossy().trim().is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        })
 }
 
 fn export_auth_archive_file(auth_dir: &Path, archive_path: &Path) -> Result<(), String> {
@@ -2210,11 +2252,29 @@ fn runtime_binary_path(runtime_path: &Path) -> PathBuf {
     runtime_path.join(binary_name())
 }
 
+fn default_package_names() -> Vec<String> {
+    current_package_target_aliases()
+        .into_iter()
+        .flat_map(|target| {
+            [
+                format!("CLIProxyAPI_{DEFAULT_RUNTIME_VERSION}_{target}.tar.gz"),
+                format!("CLIProxyAPI_{DEFAULT_RUNTIME_VERSION}_{target}.tgz"),
+                format!("CLIProxyAPI_{DEFAULT_RUNTIME_VERSION}_{target}.zip"),
+            ]
+        })
+        .collect()
+}
+
 fn default_package_name() -> String {
-    format!(
-        "CLIProxyAPI_{DEFAULT_RUNTIME_VERSION}_{}.tar.gz",
-        current_package_target()
-    )
+    default_package_names()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            format!(
+                "CLIProxyAPI_{DEFAULT_RUNTIME_VERSION}_{}.tar.gz",
+                current_package_target()
+            )
+        })
 }
 
 fn current_package_target() -> String {

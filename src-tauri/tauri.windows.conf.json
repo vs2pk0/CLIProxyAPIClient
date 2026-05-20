@@ -1,5 +1,5 @@
 {
   "bundle": {
-    "resources": []
+    "resources": ["resources/CLIProxyAPI_6.9.36_windows_amd64.zip"]
   }
 }
