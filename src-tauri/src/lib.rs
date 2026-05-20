@@ -13,6 +13,9 @@ use std::{
 use tar::{Archive, Builder};
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const BINARY_BASENAME: &str = "cli-proxy-api";
 const DEFAULT_CONFIG_CACHE: &str = "default-config.yaml";
 const DEFAULT_AUTH_DIR: &str = "~/.cli-proxy-api";
@@ -338,6 +341,8 @@ fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Des
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    hide_command_window(&mut command);
 
     command.env("MANAGEMENT_PASSWORD", management_key);
 
@@ -2129,6 +2134,15 @@ fn process_pid(process: &State<'_, ProcessState>) -> Result<Option<u32>, String>
         None => Ok(Some(child.id())),
     }
 }
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
 
 fn runtime_by_id(dirs: &AppDirs, id: &str) -> Result<RuntimeInfoInternal, String> {
     let path = dirs.runtime_dir.join(id);
