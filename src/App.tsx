@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm as confirmDialog, message as messageDialog, open, save } from "@tauri-apps/plugin-dialog";
 import {
+  Clock3,
   CheckCircle2,
   Download,
   ExternalLink,
@@ -77,8 +78,10 @@ type DownloadProgress = {
 };
 
 const LANGUAGE_STORAGE_KEY = "cliproxyapi.desktop.language";
+const AUTO_UPDATE_STORAGE_KEY = "cliproxyapi.desktop.autoUpdate";
 const DOWNLOAD_PROGRESS_EVENT = "cliproxyapi-download-progress";
 const DOWNLOAD_DONE_HIDE_MS = 2000;
+const MAX_AUTO_UPDATE_TIMEOUT_MS = 60 * 1000;
 
 const LANGUAGE_OPTIONS = [
   { code: "zh-CN", label: "中文", locale: "zh-CN" },
@@ -88,6 +91,14 @@ const LANGUAGE_OPTIONS = [
 ] as const;
 
 type LanguageCode = (typeof LANGUAGE_OPTIONS)[number]["code"];
+type AutoUpdateMode = "off" | "daily" | "monthly" | "interval";
+type AutoUpdateSettings = {
+  mode: AutoUpdateMode;
+  dayOfMonth: number;
+  hour: number;
+  minute: number;
+  second: number;
+};
 type BusyKey =
   | "idle"
   | "refresh"
@@ -141,6 +152,7 @@ type Translation = {
   open: string;
   export: string;
   import: string;
+  close: string;
   currentBinary: string;
   installedVersions: string;
   version: string;
@@ -159,6 +171,22 @@ type Translation = {
   checkUpdate: string;
   downloadLatest: string;
   checkingUpdate: string;
+  autoUpdate: string;
+  autoUpdateModeOff: string;
+  autoUpdateModeDaily: string;
+  autoUpdateModeMonthly: string;
+  autoUpdateModeInterval: string;
+  autoUpdateSettings: string;
+  autoUpdateDay: string;
+  autoUpdateHour: string;
+  autoUpdateMinute: string;
+  autoUpdateSecond: string;
+  autoUpdateNext: (time: string) => string;
+  autoUpdateCountdown: (duration: string) => string;
+  autoUpdateDays: (days: number) => string;
+  autoUpdateChecking: string;
+  autoUpdateSkippedBusy: string;
+  autoUpdateServiceRunning: string;
   cancelDownload: string;
   downloadPreparing: string;
   downloadInstalling: string;
@@ -189,6 +217,14 @@ type Translation = {
   closeSecondMessage: string;
   closeFailed: (message: string) => string;
   commands: Record<BusyKey, string>;
+};
+
+const DEFAULT_AUTO_UPDATE_SETTINGS: AutoUpdateSettings = {
+  mode: "off",
+  dayOfMonth: 1,
+  hour: 9,
+  minute: 0,
+  second: 0,
 };
 
 const TRANSLATIONS: Record<LanguageCode, Translation> = {
@@ -224,6 +260,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     open: "打开",
     export: "导出",
     import: "导入",
+    close: "关闭",
     currentBinary: "当前二进制",
     installedVersions: "已安装版本",
     version: "版本",
@@ -242,6 +279,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     checkUpdate: "检测更新",
     downloadLatest: "下载导入",
     checkingUpdate: "正在检测 CLIProxyAPI 最新版本...",
+    autoUpdate: "自动更新",
+    autoUpdateModeOff: "关闭",
+    autoUpdateModeDaily: "每天",
+    autoUpdateModeMonthly: "每月",
+    autoUpdateModeInterval: "定时",
+    autoUpdateSettings: "自动更新设置",
+    autoUpdateDay: "日",
+    autoUpdateHour: "时",
+    autoUpdateMinute: "分",
+    autoUpdateSecond: "秒",
+    autoUpdateNext: (time) => `下次 ${time}`,
+    autoUpdateCountdown: (duration) => `剩余 ${duration}`,
+    autoUpdateDays: (days) => `${days}天`,
+    autoUpdateChecking: "自动检测更新中...",
+    autoUpdateSkippedBusy: "自动更新已跳过：当前有任务正在执行。",
+    autoUpdateServiceRunning: "发现更新，但服务正在运行；请先停止服务后再自动下载导入。",
     cancelDownload: "取消下载",
     downloadPreparing: "正在准备下载...",
     downloadInstalling: "下载完成，正在自动导入...",
@@ -325,6 +378,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     open: "開啟",
     export: "匯出",
     import: "匯入",
+    close: "關閉",
     currentBinary: "目前二進位檔",
     installedVersions: "已安裝版本",
     version: "版本",
@@ -343,6 +397,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     checkUpdate: "檢查更新",
     downloadLatest: "下載匯入",
     checkingUpdate: "正在檢查 CLIProxyAPI 最新版本...",
+    autoUpdate: "自動更新",
+    autoUpdateModeOff: "關閉",
+    autoUpdateModeDaily: "每天",
+    autoUpdateModeMonthly: "每月",
+    autoUpdateModeInterval: "定時",
+    autoUpdateSettings: "自動更新設定",
+    autoUpdateDay: "日",
+    autoUpdateHour: "時",
+    autoUpdateMinute: "分",
+    autoUpdateSecond: "秒",
+    autoUpdateNext: (time) => `下次 ${time}`,
+    autoUpdateCountdown: (duration) => `剩餘 ${duration}`,
+    autoUpdateDays: (days) => `${days}天`,
+    autoUpdateChecking: "自動檢查更新中...",
+    autoUpdateSkippedBusy: "自動更新已略過：目前有任務正在執行。",
+    autoUpdateServiceRunning: "發現更新，但服務正在執行；請先停止服務後再自動下載匯入。",
     cancelDownload: "取消下載",
     downloadPreparing: "正在準備下載...",
     downloadInstalling: "下載完成，正在自動匯入...",
@@ -426,6 +496,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     open: "Open",
     export: "Export",
     import: "Import",
+    close: "Close",
     currentBinary: "Current Binary",
     installedVersions: "Installed Versions",
     version: "Version",
@@ -444,6 +515,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     checkUpdate: "Check Update",
     downloadLatest: "Download Import",
     checkingUpdate: "Checking the latest CLIProxyAPI version...",
+    autoUpdate: "Auto Update",
+    autoUpdateModeOff: "Off",
+    autoUpdateModeDaily: "Daily",
+    autoUpdateModeMonthly: "Monthly",
+    autoUpdateModeInterval: "Interval",
+    autoUpdateSettings: "Auto Update Settings",
+    autoUpdateDay: "Day",
+    autoUpdateHour: "Hour",
+    autoUpdateMinute: "Min",
+    autoUpdateSecond: "Sec",
+    autoUpdateNext: (time) => `Next ${time}`,
+    autoUpdateCountdown: (duration) => `${duration} left`,
+    autoUpdateDays: (days) => `${days}d`,
+    autoUpdateChecking: "Auto checking updates...",
+    autoUpdateSkippedBusy: "Auto update skipped because another task is running.",
+    autoUpdateServiceRunning: "Update found, but the service is running. Stop it before auto download import.",
     cancelDownload: "Cancel Download",
     downloadPreparing: "Preparing download...",
     downloadInstalling: "Download complete. Importing automatically...",
@@ -527,6 +614,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     open: "Открыть",
     export: "Экспорт",
     import: "Импорт",
+    close: "Закрыть",
     currentBinary: "Текущий бинарный файл",
     installedVersions: "Установленные версии",
     version: "Версия",
@@ -545,6 +633,22 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     checkUpdate: "Проверить",
     downloadLatest: "Скачать",
     checkingUpdate: "Проверка последней версии CLIProxyAPI...",
+    autoUpdate: "Автообновление",
+    autoUpdateModeOff: "Выкл",
+    autoUpdateModeDaily: "Ежедневно",
+    autoUpdateModeMonthly: "Ежемесячно",
+    autoUpdateModeInterval: "Интервал",
+    autoUpdateSettings: "Настройки автообновления",
+    autoUpdateDay: "День",
+    autoUpdateHour: "Час",
+    autoUpdateMinute: "Мин",
+    autoUpdateSecond: "Сек",
+    autoUpdateNext: (time) => `Далее ${time}`,
+    autoUpdateCountdown: (duration) => `Осталось ${duration}`,
+    autoUpdateDays: (days) => `${days}д`,
+    autoUpdateChecking: "Автопроверка обновлений...",
+    autoUpdateSkippedBusy: "Автообновление пропущено: выполняется другая задача.",
+    autoUpdateServiceRunning: "Обновление найдено, но сервис запущен. Остановите его перед автоимпортом.",
     cancelDownload: "Отменить",
     downloadPreparing: "Подготовка загрузки...",
     downloadInstalling: "Загрузка завершена. Автоимпорт...",
@@ -607,6 +711,10 @@ export function App() {
   const [managementKeyDraft, setManagementKeyDraft] = useState("");
   const [configDirty, setConfigDirty] = useState(false);
   const [language, setLanguage] = useState<LanguageCode>(readStoredLanguage);
+  const [autoUpdateSettings, setAutoUpdateSettings] = useState<AutoUpdateSettings>(readStoredAutoUpdateSettings);
+  const [autoUpdateDialogOpen, setAutoUpdateDialogOpen] = useState(false);
+  const [nextAutoUpdateAt, setNextAutoUpdateAt] = useState<number | null>(null);
+  const [currentTimeMs, setCurrentTimeMs] = useState(() => Date.now());
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [versionNotice, setVersionNotice] = useState<string | null>(null);
   const [versionNoticeKind, setVersionNoticeKind] = useState<"info" | "success" | "error">("info");
@@ -614,6 +722,7 @@ export function App() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const closeAllowedRef = useRef(false);
   const closeInProgressRef = useRef(false);
+  const automaticUpdateCheckRef = useRef<() => Promise<void>>(async () => undefined);
 
   const t = TRANSLATIONS[language];
 
@@ -661,6 +770,36 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
   }, [language]);
+
+  useEffect(() => {
+    localStorage.setItem(AUTO_UPDATE_STORAGE_KEY, JSON.stringify(autoUpdateSettings));
+  }, [autoUpdateSettings]);
+
+  useEffect(() => {
+    if (autoUpdateSettings.mode === "off") {
+      return undefined;
+    }
+
+    setCurrentTimeMs(Date.now());
+    const timer = window.setInterval(() => {
+      setCurrentTimeMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [autoUpdateSettings.mode]);
+
+  useEffect(() => {
+    if (!autoUpdateDialogOpen) {
+      return undefined;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAutoUpdateDialogOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [autoUpdateDialogOpen]);
 
   useEffect(() => {
     if (downloadProgress?.status !== "done") {
@@ -1025,12 +1164,12 @@ export function App() {
     }
   };
 
-  const downloadCliProxyUpdate = async () => {
+  const downloadCliProxyUpdate = useCallback(async (knownUpdateInfo: UpdateInfo | null = updateInfo) => {
     setVersionNotice(t.downloadPreparing);
     setVersionNoticeKind("info");
     setDownloadProgress({
       status: "starting",
-      assetName: updateInfo?.assetName ?? "",
+      assetName: knownUpdateInfo?.assetName ?? "",
       downloadedBytes: 0,
       totalBytes: null,
     });
@@ -1057,7 +1196,91 @@ export function App() {
       setVersionNotice(message);
       setVersionNoticeKind("error");
     }
-  };
+  }, [syncConfigForm, t, updateInfo, runCommand]);
+
+  const runAutomaticUpdateCheck = useCallback(async () => {
+    if (!state) {
+      return;
+    }
+    if (busy !== "idle" || checkingUpdate) {
+      setVersionNotice(t.autoUpdateSkippedBusy);
+      setVersionNoticeKind("info");
+      return;
+    }
+
+    setCheckingUpdate(true);
+    setError(null);
+    setVersionNotice(t.autoUpdateChecking);
+    setVersionNoticeKind("info");
+    setDownloadProgress(null);
+    try {
+      const nextUpdate = await invoke<UpdateInfo>("check_cli_proxy_update");
+      setUpdateInfo(nextUpdate);
+      if (nextUpdate.downloadUrl && nextUpdate.hasUpdate && !nextUpdate.latestInstalled) {
+        if (state.service.running) {
+          setVersionNotice(t.autoUpdateServiceRunning);
+          setVersionNoticeKind("error");
+          return;
+        }
+        setCheckingUpdate(false);
+        await downloadCliProxyUpdate(nextUpdate);
+        return;
+      }
+      setVersionNotice(formatUpdateMessage(nextUpdate, t));
+      setVersionNoticeKind("info");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setVersionNotice(message);
+      setVersionNoticeKind("error");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, [busy, checkingUpdate, downloadCliProxyUpdate, state, t]);
+
+  useEffect(() => {
+    automaticUpdateCheckRef.current = runAutomaticUpdateCheck;
+  }, [runAutomaticUpdateCheck]);
+
+  useEffect(() => {
+    if (autoUpdateSettings.mode === "off") {
+      setNextAutoUpdateAt(null);
+      return undefined;
+    }
+
+    let disposed = false;
+    let timer: number | undefined;
+
+    const scheduleFor = (targetTime: number) => {
+      const remainingMs = targetTime - Date.now();
+      const delayMs = Math.min(MAX_AUTO_UPDATE_TIMEOUT_MS, Math.max(0, remainingMs));
+      timer = window.setTimeout(async () => {
+        if (Date.now() < targetTime) {
+          scheduleFor(targetTime);
+          return;
+        }
+        await automaticUpdateCheckRef.current();
+        if (!disposed) {
+          scheduleNext(new Date(Date.now() + 1000));
+        }
+      }, delayMs);
+    };
+
+    const scheduleNext = (from = new Date()) => {
+      const nextRun = nextAutoUpdateRunAt(autoUpdateSettings, from);
+      setNextAutoUpdateAt(nextRun.getTime());
+      setCurrentTimeMs(Date.now());
+      scheduleFor(nextRun.getTime());
+    };
+
+    scheduleNext();
+
+    return () => {
+      disposed = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [autoUpdateSettings]);
 
   const cancelDownload = async () => {
     try {
@@ -1090,9 +1313,17 @@ export function App() {
     setConfigDirty(true);
   };
 
+  const updateAutoUpdateSetting = <Key extends keyof AutoUpdateSettings>(key: Key, value: AutoUpdateSettings[Key]) => {
+    setAutoUpdateSettings((current) => sanitizeAutoUpdateSettings({ ...current, [key]: value }));
+  };
+
   const canDownloadUpdate = Boolean(state && !state.service.running && busy === "idle" && !checkingUpdate && (!updateInfo || (updateInfo.downloadUrl && updateInfo.hasUpdate && !updateInfo.latestInstalled)));
   const canCancelDownload = busy === "downloadUpdate" && Boolean(downloadProgress && ["starting", "downloading"].includes(downloadProgress.status));
   const currentVersionNotice = versionNotice ?? (updateInfo ? formatUpdateMessage(updateInfo, t) : null);
+  const autoUpdateNextLabel = nextAutoUpdateAt ? t.autoUpdateNext(formatScheduledAt(nextAutoUpdateAt, language)) : null;
+  const autoUpdateCountdown = nextAutoUpdateAt ? formatDurationUntil(nextAutoUpdateAt, currentTimeMs, t) : null;
+  const autoUpdateCountdownLabel = autoUpdateCountdown ? t.autoUpdateCountdown(autoUpdateCountdown) : null;
+  const autoUpdateSummary = formatAutoUpdateSummary(autoUpdateSettings, t, autoUpdateCountdown);
 
   return (
     <main className="app-shell">
@@ -1270,6 +1501,10 @@ export function App() {
             {currentVersionNotice && <p className={`update-message ${versionNoticeKind}`}>{currentVersionNotice}</p>}
           </div>
           <div className="version-heading-actions">
+            <button className="auto-update-trigger" onClick={() => setAutoUpdateDialogOpen(true)} disabled={busy !== "idle"} title={autoUpdateNextLabel ?? t.autoUpdateSettings}>
+              <Clock3 size={15} />
+              <span>{autoUpdateSummary}</span>
+            </button>
             <button className="path-action" onClick={openCliProxyRepository} disabled={busy !== "idle"} title="https://github.com/router-for-me/CLIProxyAPI">
               <ExternalLink size={15} />
               <span>{t.sourceCode}</span>
@@ -1282,7 +1517,7 @@ export function App() {
               <RefreshCw size={15} />
               <span>{t.checkUpdate}</span>
             </button>
-            <button className="path-action primary" onClick={downloadCliProxyUpdate} disabled={!canDownloadUpdate} title={updateInfo?.assetName ?? t.downloadLatest}>
+            <button className="path-action primary" onClick={() => void downloadCliProxyUpdate()} disabled={!canDownloadUpdate} title={updateInfo?.assetName ?? t.downloadLatest}>
               <Download size={15} />
               <span>{t.downloadLatest}</span>
             </button>
@@ -1336,6 +1571,89 @@ export function App() {
           {state && state.runtimes.length === 0 && <div className="empty-state">{t.emptyVersions}</div>}
         </div>
       </section>
+
+      {autoUpdateDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setAutoUpdateDialogOpen(false)}>
+          <section className="modal-panel auto-update-dialog" role="dialog" aria-modal="true" aria-labelledby="auto-update-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-heading">
+              <div>
+                <h2 id="auto-update-title">{t.autoUpdateSettings}</h2>
+                {(autoUpdateNextLabel || autoUpdateCountdownLabel) && <p>{[autoUpdateNextLabel, autoUpdateCountdownLabel].filter(Boolean).join(" · ")}</p>}
+              </div>
+              <button className="modal-close" type="button" onClick={() => setAutoUpdateDialogOpen(false)} aria-label={t.close}>
+                ×
+              </button>
+            </div>
+
+            <div className="mode-grid" role="group" aria-label={t.autoUpdate}>
+              {(["off", "daily", "monthly", "interval"] as AutoUpdateMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={autoUpdateSettings.mode === mode ? "mode-option selected" : "mode-option"}
+                  onClick={() => updateAutoUpdateSetting("mode", mode)}
+                >
+                  {labelForAutoUpdateMode(mode, t)}
+                </button>
+              ))}
+            </div>
+
+            {autoUpdateSettings.mode !== "off" && (
+              <div className="schedule-grid">
+                {autoUpdateSettings.mode === "monthly" && (
+                  <label className="field">
+                    <span>{t.autoUpdateDay}</span>
+                    <input
+                      value={autoUpdateSettings.dayOfMonth}
+                      onChange={(event) => updateAutoUpdateSetting("dayOfMonth", Number(event.target.value))}
+                      inputMode="numeric"
+                      min={1}
+                      max={31}
+                    />
+                  </label>
+                )}
+                <label className="field">
+                  <span>{t.autoUpdateHour}</span>
+                  <input
+                    value={autoUpdateSettings.hour}
+                    onChange={(event) => updateAutoUpdateSetting("hour", Number(event.target.value))}
+                    inputMode="numeric"
+                    min={0}
+                    max={autoUpdateSettings.mode === "interval" ? 999 : 23}
+                  />
+                </label>
+                <label className="field">
+                  <span>{t.autoUpdateMinute}</span>
+                  <input
+                    value={autoUpdateSettings.minute}
+                    onChange={(event) => updateAutoUpdateSetting("minute", Number(event.target.value))}
+                    inputMode="numeric"
+                    min={0}
+                    max={59}
+                  />
+                </label>
+                <label className="field">
+                  <span>{t.autoUpdateSecond}</span>
+                  <input
+                    value={autoUpdateSettings.second}
+                    onChange={(event) => updateAutoUpdateSetting("second", Number(event.target.value))}
+                    inputMode="numeric"
+                    min={0}
+                    max={59}
+                  />
+                </label>
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button className="icon-button primary" type="button" onClick={() => setAutoUpdateDialogOpen(false)}>
+                <CheckCircle2 size={18} />
+                <span>{t.save}</span>
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -1447,12 +1765,141 @@ function readStoredLanguage(): LanguageCode {
   return isLanguageCode(stored) ? stored : "zh-CN";
 }
 
+function readStoredAutoUpdateSettings(): AutoUpdateSettings {
+  const stored = localStorage.getItem(AUTO_UPDATE_STORAGE_KEY);
+  if (!stored) {
+    return DEFAULT_AUTO_UPDATE_SETTINGS;
+  }
+  try {
+    return sanitizeAutoUpdateSettings(JSON.parse(stored));
+  } catch {
+    return DEFAULT_AUTO_UPDATE_SETTINGS;
+  }
+}
+
 function isLanguageCode(value: string | null): value is LanguageCode {
   return LANGUAGE_OPTIONS.some((option) => option.code === value);
 }
 
 function localeForLanguage(language: LanguageCode) {
   return LANGUAGE_OPTIONS.find((option) => option.code === language)?.locale ?? "zh-CN";
+}
+
+function isAutoUpdateMode(value: unknown): value is AutoUpdateMode {
+  return value === "off" || value === "daily" || value === "monthly" || value === "interval";
+}
+
+function labelForAutoUpdateMode(mode: AutoUpdateMode, t: Translation) {
+  if (mode === "daily") {
+    return t.autoUpdateModeDaily;
+  }
+  if (mode === "monthly") {
+    return t.autoUpdateModeMonthly;
+  }
+  if (mode === "interval") {
+    return t.autoUpdateModeInterval;
+  }
+  return t.autoUpdateModeOff;
+}
+
+function formatAutoUpdateSummary(settings: AutoUpdateSettings, t: Translation, countdown: string | null) {
+  if (settings.mode === "off") {
+    return t.autoUpdateModeOff;
+  }
+  if (countdown) {
+    return `${labelForAutoUpdateMode(settings.mode, t)} ${countdown}`;
+  }
+
+  const time = `${padDatePart(settings.hour)}:${padDatePart(settings.minute)}:${padDatePart(settings.second)}`;
+  if (settings.mode === "monthly") {
+    return `${t.autoUpdateModeMonthly} ${settings.dayOfMonth}${t.autoUpdateDay} ${time}`;
+  }
+  if (settings.mode === "interval") {
+    return `${t.autoUpdateModeInterval} ${settings.hour}:${padDatePart(settings.minute)}:${padDatePart(settings.second)}`;
+  }
+  return `${t.autoUpdateModeDaily} ${time}`;
+}
+
+function formatDurationUntil(targetTime: number, currentTime: number, t: Translation) {
+  const totalSeconds = Math.max(0, Math.ceil((targetTime - currentTime) / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const clock = `${days > 0 ? padDatePart(hours) : hours}:${padDatePart(minutes)}:${padDatePart(seconds)}`;
+  return days > 0 ? `${t.autoUpdateDays(days)} ${clock}` : clock;
+}
+
+function sanitizeAutoUpdateSettings(value: unknown): AutoUpdateSettings {
+  const source = typeof value === "object" && value !== null ? (value as Partial<AutoUpdateSettings>) : {};
+  const mode = isAutoUpdateMode(source.mode) ? source.mode : DEFAULT_AUTO_UPDATE_SETTINGS.mode;
+  const hour = clampInteger(source.hour, 0, mode === "interval" ? 999 : 23, DEFAULT_AUTO_UPDATE_SETTINGS.hour);
+  const minute = clampInteger(source.minute, 0, 59, DEFAULT_AUTO_UPDATE_SETTINGS.minute);
+  let second = clampInteger(source.second, 0, 59, DEFAULT_AUTO_UPDATE_SETTINGS.second);
+  if (mode === "interval" && hour === 0 && minute === 0 && second === 0) {
+    second = 1;
+  }
+  return {
+    mode,
+    dayOfMonth: clampInteger(source.dayOfMonth, 1, 31, DEFAULT_AUTO_UPDATE_SETTINGS.dayOfMonth),
+    hour,
+    minute,
+    second,
+  };
+}
+
+function clampInteger(value: unknown, min: number, max: number, fallback: number) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.trunc(numeric)));
+}
+
+function nextAutoUpdateRunAt(settings: AutoUpdateSettings, from: Date) {
+  if (settings.mode === "interval") {
+    return new Date(from.getTime() + autoUpdateIntervalMs(settings));
+  }
+
+  if (settings.mode === "monthly") {
+    const thisMonth = scheduledMonthlyDate(from.getFullYear(), from.getMonth(), settings);
+    if (thisMonth.getTime() > from.getTime()) {
+      return thisMonth;
+    }
+    const nextMonth = new Date(from.getFullYear(), from.getMonth() + 1, 1);
+    return scheduledMonthlyDate(nextMonth.getFullYear(), nextMonth.getMonth(), settings);
+  }
+
+  const nextDaily = new Date(from);
+  nextDaily.setHours(settings.hour, settings.minute, settings.second, 0);
+  if (nextDaily.getTime() <= from.getTime()) {
+    nextDaily.setDate(nextDaily.getDate() + 1);
+  }
+  return nextDaily;
+}
+
+function scheduledMonthlyDate(year: number, month: number, settings: AutoUpdateSettings) {
+  const day = Math.min(settings.dayOfMonth, daysInMonth(year, month));
+  return new Date(year, month, day, settings.hour, settings.minute, settings.second, 0);
+}
+
+function daysInMonth(year: number, month: number) {
+  return new Date(year, month + 1, 0).getDate();
+}
+
+function autoUpdateIntervalMs(settings: AutoUpdateSettings) {
+  const seconds = settings.hour * 3600 + settings.minute * 60 + settings.second;
+  return Math.max(1, seconds) * 1000;
+}
+
+function formatScheduledAt(value: number, language: LanguageCode) {
+  return new Intl.DateTimeFormat(localeForLanguage(language), {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(value));
 }
 
 function defaultAuthArchiveName() {

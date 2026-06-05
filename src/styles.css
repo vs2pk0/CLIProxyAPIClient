@@ -431,6 +431,137 @@ h2 {
   border-color: #246b63;
 }
 
+.auto-update-trigger {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid #cbd4cc;
+  border-radius: 8px;
+  color: #263139;
+  background: #fbfcfb;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.auto-update-trigger:hover:not(:disabled) {
+  border-color: #8da09b;
+  background: #ffffff;
+}
+
+.auto-update-trigger:focus-visible {
+  border-color: #246b63;
+  box-shadow: 0 0 0 2px rgba(36, 107, 99, 0.12);
+  outline: none;
+}
+
+.auto-update-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.auto-update-trigger span {
+  font-variant-numeric: tabular-nums;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(19, 27, 32, 0.34);
+}
+
+.modal-panel {
+  width: min(440px, 100%);
+  border: 1px solid #d3ddd6;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 80px rgba(18, 28, 34, 0.2);
+}
+
+.modal-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid #e5eae6;
+}
+
+.modal-heading p {
+  margin-top: 6px;
+  color: #68757c;
+  font-size: 12px;
+}
+
+.modal-close {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d5ded8;
+  border-radius: 8px;
+  color: #4f5d64;
+  background: #f8faf8;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.auto-update-dialog {
+  overflow: hidden;
+}
+
+.mode-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 18px 18px 0;
+}
+
+.mode-option {
+  min-height: 36px;
+  border: 1px solid #d5ded8;
+  border-radius: 8px;
+  color: #334047;
+  background: #f8faf8;
+  cursor: pointer;
+}
+
+.mode-option.selected {
+  color: #ffffff;
+  background: #246b63;
+  border-color: #246b63;
+}
+
+.schedule-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 16px 18px 0;
+}
+
+.schedule-grid .field {
+  min-width: 0;
+}
+
+.schedule-grid .field input {
+  text-align: center;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 18px;
+}
+
 .versions-panel {
   margin-top: 16px;
   overflow: hidden;
@@ -642,6 +773,15 @@ h2 {
   .service-grid,
   .table-row {
     grid-template-columns: 1fr;
+  }
+
+  .auto-update-trigger {
+    width: 100%;
+  }
+
+  .mode-grid,
+  .schedule-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .table-row {
