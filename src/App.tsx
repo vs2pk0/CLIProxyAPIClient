@@ -82,6 +82,7 @@ const AUTO_UPDATE_STORAGE_KEY = "cliproxyapi.desktop.autoUpdate";
 const DOWNLOAD_PROGRESS_EVENT = "cliproxyapi-download-progress";
 const DOWNLOAD_DONE_HIDE_MS = 2000;
 const MAX_AUTO_UPDATE_TIMEOUT_MS = 60 * 1000;
+const AUTO_UPDATE_RETRY_MS = 60 * 1000;
 
 const LANGUAGE_OPTIONS = [
   { code: "zh-CN", label: "中文", locale: "zh-CN" },
@@ -99,6 +100,14 @@ type AutoUpdateSettings = {
   minute: number;
   second: number;
 };
+type AutoUpdateFormDraft = {
+  mode: AutoUpdateMode;
+  dayOfMonth: string;
+  hour: string;
+  minute: string;
+  second: string;
+};
+type AutoUpdateRunResult = "completed" | "retry";
 type BusyKey =
   | "idle"
   | "refresh"
@@ -294,7 +303,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     autoUpdateDays: (days) => `${days}天`,
     autoUpdateChecking: "自动检测更新中...",
     autoUpdateSkippedBusy: "自动更新已跳过：当前有任务正在执行。",
-    autoUpdateServiceRunning: "发现更新，但服务正在运行；请先停止服务后再自动下载导入。",
+    autoUpdateServiceRunning: "发现更新，下载完成后会自动重启服务。",
     cancelDownload: "取消下载",
     downloadPreparing: "正在准备下载...",
     downloadInstalling: "下载完成，正在自动导入...",
@@ -412,7 +421,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     autoUpdateDays: (days) => `${days}天`,
     autoUpdateChecking: "自動檢查更新中...",
     autoUpdateSkippedBusy: "自動更新已略過：目前有任務正在執行。",
-    autoUpdateServiceRunning: "發現更新，但服務正在執行；請先停止服務後再自動下載匯入。",
+    autoUpdateServiceRunning: "發現更新，下載完成後會自動重啟服務。",
     cancelDownload: "取消下載",
     downloadPreparing: "正在準備下載...",
     downloadInstalling: "下載完成，正在自動匯入...",
@@ -530,7 +539,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     autoUpdateDays: (days) => `${days}d`,
     autoUpdateChecking: "Auto checking updates...",
     autoUpdateSkippedBusy: "Auto update skipped because another task is running.",
-    autoUpdateServiceRunning: "Update found, but the service is running. Stop it before auto download import.",
+    autoUpdateServiceRunning: "Update found. The service will restart automatically after download.",
     cancelDownload: "Cancel Download",
     downloadPreparing: "Preparing download...",
     downloadInstalling: "Download complete. Importing automatically...",
@@ -648,7 +657,7 @@ const TRANSLATIONS: Record<LanguageCode, Translation> = {
     autoUpdateDays: (days) => `${days}д`,
     autoUpdateChecking: "Автопроверка обновлений...",
     autoUpdateSkippedBusy: "Автообновление пропущено: выполняется другая задача.",
-    autoUpdateServiceRunning: "Обновление найдено, но сервис запущен. Остановите его перед автоимпортом.",
+    autoUpdateServiceRunning: "Найдено обновление. Сервис перезапустится автоматически после загрузки.",
     cancelDownload: "Отменить",
     downloadPreparing: "Подготовка загрузки...",
     downloadInstalling: "Загрузка завершена. Автоимпорт...",
@@ -712,6 +721,7 @@ export function App() {
   const [configDirty, setConfigDirty] = useState(false);
   const [language, setLanguage] = useState<LanguageCode>(readStoredLanguage);
   const [autoUpdateSettings, setAutoUpdateSettings] = useState<AutoUpdateSettings>(readStoredAutoUpdateSettings);
+  const [autoUpdateDraft, setAutoUpdateDraft] = useState<AutoUpdateFormDraft>(() => autoUpdateSettingsToForm(readStoredAutoUpdateSettings()));
   const [autoUpdateDialogOpen, setAutoUpdateDialogOpen] = useState(false);
   const [nextAutoUpdateAt, setNextAutoUpdateAt] = useState<number | null>(null);
   const [currentTimeMs, setCurrentTimeMs] = useState(() => Date.now());
@@ -722,7 +732,7 @@ export function App() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const closeAllowedRef = useRef(false);
   const closeInProgressRef = useRef(false);
-  const automaticUpdateCheckRef = useRef<() => Promise<void>>(async () => undefined);
+  const automaticUpdateCheckRef = useRef<() => Promise<AutoUpdateRunResult>>(async () => "completed");
 
   const t = TRANSLATIONS[language];
 
@@ -824,10 +834,10 @@ export function App() {
       }
       setDownloadProgress(event.payload);
       if (event.payload.status === "installing") {
-        setVersionNotice(t.downloadInstalling);
+        setVersionNotice(formatDownloadProgress(event.payload, t));
         setVersionNoticeKind("info");
       } else if (event.payload.status === "done") {
-        setVersionNotice(t.downloadDone);
+        setVersionNotice(formatDownloadProgress(event.payload, t));
         setVersionNoticeKind("success");
       } else if (event.payload.status === "cancelled") {
         setVersionNotice(t.downloadCanceled);
@@ -1182,30 +1192,33 @@ export function App() {
         setManagementKeyDraft(nextState.config?.localManagementKey ?? "");
         const nextUpdate = await invoke<UpdateInfo>("check_cli_proxy_update").catch(() => null);
         setUpdateInfo(nextUpdate);
-        setVersionNotice(t.downloadDone);
+        setVersionNotice((current) => (current && current !== t.downloadPreparing ? current : t.downloadDone));
         setVersionNoticeKind("success");
       });
+      return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes("下载已取消")) {
         setError(null);
         setVersionNotice(t.downloadCanceled);
         setVersionNoticeKind("info");
-        return;
+        return false;
       }
       setVersionNotice(message);
       setVersionNoticeKind("error");
+      await refresh().catch(() => undefined);
+      return false;
     }
-  }, [syncConfigForm, t, updateInfo, runCommand]);
+  }, [syncConfigForm, t, updateInfo, runCommand, refresh]);
 
-  const runAutomaticUpdateCheck = useCallback(async () => {
+  const runAutomaticUpdateCheck = useCallback(async (): Promise<AutoUpdateRunResult> => {
     if (!state) {
-      return;
+      return "retry";
     }
     if (busy !== "idle" || checkingUpdate) {
       setVersionNotice(t.autoUpdateSkippedBusy);
       setVersionNoticeKind("info");
-      return;
+      return "retry";
     }
 
     setCheckingUpdate(true);
@@ -1217,21 +1230,20 @@ export function App() {
       const nextUpdate = await invoke<UpdateInfo>("check_cli_proxy_update");
       setUpdateInfo(nextUpdate);
       if (nextUpdate.downloadUrl && nextUpdate.hasUpdate && !nextUpdate.latestInstalled) {
-        if (state.service.running) {
-          setVersionNotice(t.autoUpdateServiceRunning);
-          setVersionNoticeKind("error");
-          return;
-        }
+        setVersionNotice(state.service.running ? t.autoUpdateServiceRunning : t.downloadPreparing);
+        setVersionNoticeKind("info");
         setCheckingUpdate(false);
-        await downloadCliProxyUpdate(nextUpdate);
-        return;
+        const downloaded = await downloadCliProxyUpdate(nextUpdate);
+        return downloaded ? "completed" : "retry";
       }
       setVersionNotice(formatUpdateMessage(nextUpdate, t));
       setVersionNoticeKind("info");
+      return "completed";
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setVersionNotice(message);
       setVersionNoticeKind("error");
+      return "completed";
     } finally {
       setCheckingUpdate(false);
     }
@@ -1254,12 +1266,21 @@ export function App() {
       const remainingMs = targetTime - Date.now();
       const delayMs = Math.min(MAX_AUTO_UPDATE_TIMEOUT_MS, Math.max(0, remainingMs));
       timer = window.setTimeout(async () => {
+        if (disposed) {
+          return;
+        }
         if (Date.now() < targetTime) {
           scheduleFor(targetTime);
           return;
         }
-        await automaticUpdateCheckRef.current();
+        const result = await automaticUpdateCheckRef.current();
         if (!disposed) {
+          if (result === "retry") {
+            const retryAt = Date.now() + AUTO_UPDATE_RETRY_MS;
+            setNextAutoUpdateAt(retryAt);
+            scheduleFor(retryAt);
+            return;
+          }
           scheduleNext(new Date(Date.now() + 1000));
         }
       }, delayMs);
@@ -1313,11 +1334,25 @@ export function App() {
     setConfigDirty(true);
   };
 
-  const updateAutoUpdateSetting = <Key extends keyof AutoUpdateSettings>(key: Key, value: AutoUpdateSettings[Key]) => {
-    setAutoUpdateSettings((current) => sanitizeAutoUpdateSettings({ ...current, [key]: value }));
+  const openAutoUpdateDialog = () => {
+    setAutoUpdateDraft(autoUpdateSettingsToForm(autoUpdateSettings));
+    setAutoUpdateDialogOpen(true);
   };
 
-  const canDownloadUpdate = Boolean(state && !state.service.running && busy === "idle" && !checkingUpdate && (!updateInfo || (updateInfo.downloadUrl && updateInfo.hasUpdate && !updateInfo.latestInstalled)));
+  const closeAutoUpdateDialog = () => {
+    setAutoUpdateDialogOpen(false);
+  };
+
+  const saveAutoUpdateDialog = () => {
+    setAutoUpdateSettings(autoUpdateFormToSettings(autoUpdateDraft));
+    setAutoUpdateDialogOpen(false);
+  };
+
+  const updateAutoUpdateDraft = <Key extends keyof AutoUpdateFormDraft>(key: Key, value: AutoUpdateFormDraft[Key]) => {
+    setAutoUpdateDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const canDownloadUpdate = Boolean(state && busy === "idle" && !checkingUpdate && (!updateInfo || (updateInfo.downloadUrl && updateInfo.hasUpdate && !updateInfo.latestInstalled)));
   const canCancelDownload = busy === "downloadUpdate" && Boolean(downloadProgress && ["starting", "downloading"].includes(downloadProgress.status));
   const currentVersionNotice = versionNotice ?? (updateInfo ? formatUpdateMessage(updateInfo, t) : null);
   const autoUpdateNextLabel = nextAutoUpdateAt ? t.autoUpdateNext(formatScheduledAt(nextAutoUpdateAt, language)) : null;
@@ -1501,7 +1536,7 @@ export function App() {
             {currentVersionNotice && <p className={`update-message ${versionNoticeKind}`}>{currentVersionNotice}</p>}
           </div>
           <div className="version-heading-actions">
-            <button className="auto-update-trigger" onClick={() => setAutoUpdateDialogOpen(true)} disabled={busy !== "idle"} title={autoUpdateNextLabel ?? t.autoUpdateSettings}>
+            <button className="auto-update-trigger" onClick={openAutoUpdateDialog} disabled={busy !== "idle"} title={autoUpdateNextLabel ?? t.autoUpdateSettings}>
               <Clock3 size={15} />
               <span>{autoUpdateSummary}</span>
             </button>
@@ -1573,14 +1608,14 @@ export function App() {
       </section>
 
       {autoUpdateDialogOpen && (
-        <div className="modal-backdrop" role="presentation" onClick={() => setAutoUpdateDialogOpen(false)}>
+        <div className="modal-backdrop" role="presentation" onClick={closeAutoUpdateDialog}>
           <section className="modal-panel auto-update-dialog" role="dialog" aria-modal="true" aria-labelledby="auto-update-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-heading">
               <div>
                 <h2 id="auto-update-title">{t.autoUpdateSettings}</h2>
                 {(autoUpdateNextLabel || autoUpdateCountdownLabel) && <p>{[autoUpdateNextLabel, autoUpdateCountdownLabel].filter(Boolean).join(" · ")}</p>}
               </div>
-              <button className="modal-close" type="button" onClick={() => setAutoUpdateDialogOpen(false)} aria-label={t.close}>
+              <button className="modal-close" type="button" onClick={closeAutoUpdateDialog} aria-label={t.close}>
                 ×
               </button>
             </div>
@@ -1590,22 +1625,23 @@ export function App() {
                 <button
                   key={mode}
                   type="button"
-                  className={autoUpdateSettings.mode === mode ? "mode-option selected" : "mode-option"}
-                  onClick={() => updateAutoUpdateSetting("mode", mode)}
+                  className={autoUpdateDraft.mode === mode ? "mode-option selected" : "mode-option"}
+                  aria-pressed={autoUpdateDraft.mode === mode}
+                  onClick={() => updateAutoUpdateDraft("mode", mode)}
                 >
                   {labelForAutoUpdateMode(mode, t)}
                 </button>
               ))}
             </div>
 
-            {autoUpdateSettings.mode !== "off" && (
+            {autoUpdateDraft.mode !== "off" && (
               <div className="schedule-grid">
-                {autoUpdateSettings.mode === "monthly" && (
+                {autoUpdateDraft.mode === "monthly" && (
                   <label className="field">
                     <span>{t.autoUpdateDay}</span>
                     <input
-                      value={autoUpdateSettings.dayOfMonth}
-                      onChange={(event) => updateAutoUpdateSetting("dayOfMonth", Number(event.target.value))}
+                      value={autoUpdateDraft.dayOfMonth}
+                      onChange={(event) => updateAutoUpdateDraft("dayOfMonth", event.target.value)}
                       inputMode="numeric"
                       min={1}
                       max={31}
@@ -1615,18 +1651,18 @@ export function App() {
                 <label className="field">
                   <span>{t.autoUpdateHour}</span>
                   <input
-                    value={autoUpdateSettings.hour}
-                    onChange={(event) => updateAutoUpdateSetting("hour", Number(event.target.value))}
+                    value={autoUpdateDraft.hour}
+                    onChange={(event) => updateAutoUpdateDraft("hour", event.target.value)}
                     inputMode="numeric"
                     min={0}
-                    max={autoUpdateSettings.mode === "interval" ? 999 : 23}
+                    max={autoUpdateDraft.mode === "interval" ? 999 : 23}
                   />
                 </label>
                 <label className="field">
                   <span>{t.autoUpdateMinute}</span>
                   <input
-                    value={autoUpdateSettings.minute}
-                    onChange={(event) => updateAutoUpdateSetting("minute", Number(event.target.value))}
+                    value={autoUpdateDraft.minute}
+                    onChange={(event) => updateAutoUpdateDraft("minute", event.target.value)}
                     inputMode="numeric"
                     min={0}
                     max={59}
@@ -1635,8 +1671,8 @@ export function App() {
                 <label className="field">
                   <span>{t.autoUpdateSecond}</span>
                   <input
-                    value={autoUpdateSettings.second}
-                    onChange={(event) => updateAutoUpdateSetting("second", Number(event.target.value))}
+                    value={autoUpdateDraft.second}
+                    onChange={(event) => updateAutoUpdateDraft("second", event.target.value)}
                     inputMode="numeric"
                     min={0}
                     max={59}
@@ -1646,7 +1682,7 @@ export function App() {
             )}
 
             <div className="modal-actions">
-              <button className="icon-button primary" type="button" onClick={() => setAutoUpdateDialogOpen(false)}>
+              <button className="icon-button primary" type="button" onClick={saveAutoUpdateDialog}>
                 <CheckCircle2 size={18} />
                 <span>{t.save}</span>
               </button>
@@ -1693,10 +1729,10 @@ function formatDownloadProgress(progress: DownloadProgress, t: Translation) {
     return t.downloadPreparing;
   }
   if (progress.status === "installing") {
-    return t.downloadInstalling;
+    return progress.message ?? t.downloadInstalling;
   }
   if (progress.status === "done") {
-    return t.downloadDone;
+    return progress.message ?? t.downloadDone;
   }
   if (progress.status === "cancelled") {
     return t.downloadCanceled;
@@ -1828,6 +1864,26 @@ function formatDurationUntil(targetTime: number, currentTime: number, t: Transla
   const seconds = totalSeconds % 60;
   const clock = `${days > 0 ? padDatePart(hours) : hours}:${padDatePart(minutes)}:${padDatePart(seconds)}`;
   return days > 0 ? `${t.autoUpdateDays(days)} ${clock}` : clock;
+}
+
+function autoUpdateSettingsToForm(settings: AutoUpdateSettings): AutoUpdateFormDraft {
+  return {
+    mode: settings.mode,
+    dayOfMonth: String(settings.dayOfMonth),
+    hour: String(settings.hour),
+    minute: String(settings.minute),
+    second: String(settings.second),
+  };
+}
+
+function autoUpdateFormToSettings(draft: AutoUpdateFormDraft): AutoUpdateSettings {
+  return sanitizeAutoUpdateSettings({
+    mode: draft.mode,
+    dayOfMonth: draft.dayOfMonth,
+    hour: draft.hour,
+    minute: draft.minute,
+    second: draft.second,
+  });
 }
 
 function sanitizeAutoUpdateSettings(value: unknown): AutoUpdateSettings {

@@ -308,11 +308,18 @@ fn delete_version(
 
 #[tauri::command]
 fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<DesktopState, String> {
-    if process_pid(&process)?.is_some() {
-        return build_desktop_state(&app, &process);
+    start_service_impl(&app, &process)
+}
+
+fn start_service_impl(
+    app: &AppHandle,
+    process: &State<'_, ProcessState>,
+) -> Result<DesktopState, String> {
+    if process_pid(process)?.is_some() {
+        return build_desktop_state(app, process);
     }
 
-    let dirs = AppDirs::new(&app)?;
+    let dirs = AppDirs::new(app)?;
     let mut stored = read_stored_state(&dirs)?;
     let active_id = stored
         .active_version
@@ -326,10 +333,10 @@ fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Des
     if let Some(pid) = detect_managed_service_pid(&dirs, &stored, &config_path)? {
         stored.managed_pid = Some(pid);
         write_stored_state(&dirs, &stored)?;
-        if let Err(err) = restore_usage_statistics(&app) {
+        if let Err(err) = restore_usage_statistics(app) {
             eprintln!("failed to restore CLIProxyAPI usage statistics: {err}");
         }
-        return build_desktop_state(&app, &process);
+        return build_desktop_state(app, process);
     }
     reject_unmanaged_port_listener(&dirs, &config_path)?;
 
@@ -361,16 +368,23 @@ fn start_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Des
     stored.managed_pid = Some(child_pid);
     write_stored_state(&dirs, &stored)?;
 
-    if let Err(err) = restore_usage_statistics(&app) {
+    if let Err(err) = restore_usage_statistics(app) {
         eprintln!("failed to restore CLIProxyAPI usage statistics: {err}");
     }
 
-    build_desktop_state(&app, &process)
+    build_desktop_state(app, process)
 }
 
 #[tauri::command]
 fn stop_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<DesktopState, String> {
-    if let Err(err) = backup_usage_statistics(&app, &process) {
+    stop_service_impl(&app, &process)
+}
+
+fn stop_service_impl(
+    app: &AppHandle,
+    process: &State<'_, ProcessState>,
+) -> Result<DesktopState, String> {
+    if let Err(err) = backup_usage_statistics(app, process) {
         eprintln!("failed to backup CLIProxyAPI usage statistics: {err}");
     }
 
@@ -390,7 +404,7 @@ fn stop_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Desk
     *guard = None;
     drop(guard);
 
-    let dirs = AppDirs::new(&app)?;
+    let dirs = AppDirs::new(app)?;
     let mut stored = read_stored_state(&dirs)?;
     if let Some(active_id) = stored.active_version.as_deref() {
         let runtime = runtime_by_id(&dirs, active_id)?;
@@ -402,12 +416,12 @@ fn stop_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<Desk
     stored.managed_pid = None;
     write_stored_state(&dirs, &stored)?;
 
-    build_desktop_state(&app, &process)
+    build_desktop_state(app, process)
 }
 
 #[tauri::command]
 fn shutdown_service(app: AppHandle, process: State<'_, ProcessState>) -> Result<(), String> {
-    stop_service(app, process).map(|_| ())
+    stop_service_impl(&app, &process).map(|_| ())
 }
 
 #[tauri::command]
@@ -522,10 +536,7 @@ fn download_cli_proxy_update_impl(
     process: State<'_, ProcessState>,
     download: State<'_, DownloadState>,
 ) -> Result<DesktopState, String> {
-    if service_pid_for_state(&app, &process)?.is_some() {
-        return Err("请先停止当前服务，再下载并切换 CLIProxyAPI 版本包".to_string());
-    }
-
+    let service_running_at_start = service_pid_for_state(&app, &process)?.is_some();
     let download_id = begin_download(&download)?;
     let result: Result<DesktopState, String> = (|| {
         let dirs = AppDirs::new(&app)?;
@@ -545,17 +556,113 @@ fn download_cli_proxy_update_impl(
             &asset_name,
             &download_url,
         )?;
+        let previous_active_version = read_stored_state(&dirs)?.active_version;
         emit_download_progress(
             &app,
             "installing",
             &asset_name,
             0,
             None,
-            Some("正在自动导入"),
+            if service_running_at_start {
+                Some("下载完成，正在导入新版")
+            } else {
+                Some("正在自动导入")
+            },
         )?;
-        install_runtime_package(&app, &package_path, true)?;
-        let next_state = build_desktop_state(&app, &process)?;
-        emit_download_progress(&app, "done", &asset_name, 0, None, Some("下载导入完成"))?;
+        let runtime = match install_runtime_package(&app, &package_path, false) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                if service_running_at_start {
+                    return Err(format!("导入新版失败，旧服务仍在运行: {err}"));
+                }
+                return Err(err);
+            }
+        };
+        let service_running_before_switch = service_pid_for_state(&app, &process)?.is_some();
+        let restart_service = service_running_at_start || service_running_before_switch;
+        if service_running_before_switch {
+            emit_download_progress(
+                &app,
+                "installing",
+                &asset_name,
+                0,
+                None,
+                Some("已导入新版，正在停止服务"),
+            )?;
+            stop_service_impl(&app, &process)?;
+        }
+        if let Err(err) = activate_runtime_version(&dirs, runtime.id) {
+            if restart_service {
+                emit_download_progress(
+                    &app,
+                    "installing",
+                    &asset_name,
+                    0,
+                    None,
+                    Some("切换失败，正在恢复旧服务"),
+                )?;
+                return match restore_previous_service(
+                    &app,
+                    &process,
+                    &dirs,
+                    previous_active_version,
+                ) {
+                    Ok(()) => Err(format!("切换新版失败，已恢复旧服务: {err}")),
+                    Err(restore_err) => Err(format!(
+                        "切换新版失败，恢复旧服务也失败: {err}; {restore_err}"
+                    )),
+                };
+            }
+            return Err(err);
+        }
+        let next_state = if restart_service {
+            emit_download_progress(
+                &app,
+                "installing",
+                &asset_name,
+                0,
+                None,
+                Some("已导入新版，正在启动服务"),
+            )?;
+            match start_service_impl(&app, &process) {
+                Ok(state) => state,
+                Err(err) => {
+                    emit_download_progress(
+                        &app,
+                        "installing",
+                        &asset_name,
+                        0,
+                        None,
+                        Some("新版启动失败，正在恢复旧服务"),
+                    )?;
+                    return match restore_previous_service(
+                        &app,
+                        &process,
+                        &dirs,
+                        previous_active_version,
+                    ) {
+                        Ok(()) => Err(format!("新版服务启动失败，已恢复旧服务: {err}")),
+                        Err(restore_err) => Err(format!(
+                            "新版服务启动失败，恢复旧服务也失败: {err}; {restore_err}"
+                        )),
+                    };
+                }
+            }
+        } else {
+            build_desktop_state(&app, &process)?
+        };
+        emit_download_progress(
+            &app,
+            "done",
+            &asset_name,
+            0,
+            None,
+            if restart_service {
+                Some("下载导入完成，服务已重启")
+            } else {
+                Some("下载导入完成")
+            },
+        )?;
         Ok(next_state)
     })();
 
@@ -566,6 +673,28 @@ fn download_cli_proxy_update_impl(
     }
     clear_download(&download, &download_id);
     result
+}
+
+fn restore_previous_service(
+    app: &AppHandle,
+    process: &State<'_, ProcessState>,
+    dirs: &AppDirs,
+    previous_active_version: Option<String>,
+) -> Result<(), String> {
+    let Some(active_version) = previous_active_version else {
+        return Err("没有可恢复的旧版本".to_string());
+    };
+
+    let mut state = read_stored_state(dirs)?;
+    state.active_version = Some(active_version);
+    write_stored_state(dirs, &state)?;
+    start_service_impl(app, process).map(|_| ())
+}
+
+fn activate_runtime_version(dirs: &AppDirs, runtime_id: String) -> Result<(), String> {
+    let mut state = read_stored_state(dirs)?;
+    state.active_version = Some(runtime_id);
+    write_stored_state(dirs, &state)
 }
 
 fn fetch_latest_release() -> Result<GitHubRelease, String> {
